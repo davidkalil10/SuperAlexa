@@ -199,10 +199,226 @@
                                                                                        "a respeito de {query}",
                                                                                        "fale a respeito de {query}"
                                                                                    ]
+                                                                   },
+                                                                   {
+                                                                       "name":  "CatchAllIntent",
+                                                                       "slots":  [
+                                                                                     {
+                                                                                         "name":  "text",
+                                                                                         "type":  "CATCH_ALL_TEXT"
+                                                                                     }
+                                                                                 ],
+                                                                       "samples":  [
+                                                                                       "{text}"
+                                                                                   ]
                                                                    }
                                                                ],
                                                    "types":  [
-
+                                                                 {
+                                                                     "name":  "CATCH_ALL_TEXT",
+                                                                     "values":  [
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "casa"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "carro"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "história"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "jogo"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "herói"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "pessoa"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "empresa"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "cidade"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "filme"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "música"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "comida"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "dinheiro"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "tempo"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "ciência"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "saúde"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "amigo"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "trabalho"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "escola"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "computador"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "telefone"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "animal"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "país"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "livro"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "time"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "futebol"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "receita"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "viagem"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "planeta"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "tecnologia"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "internet"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "personagem"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "família"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "dia"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "ano"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "coisa"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "nome"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "lugar"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "história antiga"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "guerra"
+                                                                                                 }
+                                                                                    },
+                                                                                    {
+                                                                                        "name":  {
+                                                                                                     "value":  "arte"
+                                                                                                 }
+                                                                                    }
+                                                                                ]
+                                                                 }
                                                              ]
                                                }
                          }

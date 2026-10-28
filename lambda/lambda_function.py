@@ -78,6 +78,8 @@ RESET_PHRASES = (
 )
 
 MSG_WELCOME = "Modo super ativado! Pode falar, sobre o que vamos conversar?"
+STOP_WORDS = {"parar", "para", "pare", "sair", "tchau", "cancelar", "cancela", "encerrar", "ate logo", "chega", "fechar"}
+HELP_WORDS = {"ajuda", "me ajuda", "socorro"}
 MSG_REPROMPT = "Pode continuar, estou ouvindo."
 MSG_HELP = (
     "Eu sou uma assistente com inteligencia artificial. Faca qualquer pergunta, por exemplo: "
@@ -306,6 +308,23 @@ class ChatIntentHandler(AbstractRequestHandler):
         return _converse(handler_input, query)
 
 
+class CatchAllIntentHandler(AbstractRequestHandler):
+    """Pega qualquer fala livre e a repassa ao LLM (ele entende o contexto sozinho)."""
+
+    def can_handle(self, handler_input):
+        return ask_utils.is_intent_name("CatchAllIntent")(handler_input)
+
+    def handle(self, handler_input):
+        text = ask_utils.get_slot_value(handler_input, "text")
+        norm = _normalize(text)
+        # O pega-tudo pode capturar comandos basicos: tratamos aqui.
+        if norm in STOP_WORDS:
+            return handler_input.response_builder.speak(MSG_BYE).set_should_end_session(True).response
+        if norm in HELP_WORDS:
+            return _ask(handler_input, MSG_HELP)
+        return _converse(handler_input, text)
+
+
 class ResetHistoryIntentHandler(AbstractRequestHandler):
     def can_handle(self, handler_input):
         return ask_utils.is_intent_name("ResetHistoryIntent")(handler_input)
@@ -385,6 +404,7 @@ sb = CustomSkillBuilder(persistence_adapter=_build_persistence_adapter())
 sb.add_request_handler(LaunchRequestHandler())
 sb.add_request_handler(ResetHistoryIntentHandler())
 sb.add_request_handler(ChatIntentHandler())
+sb.add_request_handler(CatchAllIntentHandler())
 sb.add_request_handler(HelpIntentHandler())
 sb.add_request_handler(CancelOrStopIntentHandler())
 sb.add_request_handler(FallbackIntentHandler())
