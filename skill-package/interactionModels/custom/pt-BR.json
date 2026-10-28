@@ -1,0 +1,96 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "modo super",
+      "intents": [
+        { "name": "AMAZON.CancelIntent", "samples": [] },
+        { "name": "AMAZON.HelpIntent", "samples": [] },
+        { "name": "AMAZON.StopIntent", "samples": [] },
+        { "name": "AMAZON.FallbackIntent", "samples": [] },
+        {
+          "name": "ResetHistoryIntent",
+          "slots": [],
+          "samples": [
+            "nova conversa",
+            "iniciar nova conversa",
+            "comecar uma nova conversa",
+            "começar de novo",
+            "esquecer tudo",
+            "esqueça tudo",
+            "zerar memória",
+            "zerar histórico",
+            "limpar memória",
+            "limpar histórico",
+            "apagar memória",
+            "apagar histórico",
+            "apague a memória",
+            "apague o histórico"
+          ]
+        },
+        {
+          "name": "ChatIntent",
+          "slots": [
+            { "name": "query", "type": "AMAZON.SearchQuery" }
+          ],
+          "samples": [
+            "me explique {query}",
+            "explique {query}",
+            "me diga {query}",
+            "diga {query}",
+            "me fale {query}",
+            "fale {query}",
+            "me conte {query}",
+            "conte {query}",
+            "quero saber {query}",
+            "eu quero saber {query}",
+            "pergunte {query}",
+            "pergunta {query}",
+            "responda {query}",
+            "me responda {query}",
+            "me ajude {query}",
+            "me ajude com {query}",
+            "me dê {query}",
+            "me ensine {query}",
+            "pesquise {query}",
+            "o que é {query}",
+            "o que são {query}",
+            "o que significa {query}",
+            "quem é {query}",
+            "quem foi {query}",
+            "quem são {query}",
+            "como {query}",
+            "como funciona {query}",
+            "como faço {query}",
+            "por que {query}",
+            "porque {query}",
+            "quando {query}",
+            "onde {query}",
+            "qual {query}",
+            "qual é {query}",
+            "quais {query}",
+            "quanto {query}",
+            "será que {query}",
+            "tem como {query}",
+            "pode {query}",
+            "você pode {query}",
+            "você sabe {query}",
+            "escreva {query}",
+            "crie {query}",
+            "traduza {query}",
+            "resuma {query}",
+            "calcule {query}",
+            "sugira {query}",
+            "e {query}",
+            "então {query}",
+            "mas {query}",
+            "continue {query}",
+            "sobre {query}",
+            "fale sobre {query}",
+            "me fale sobre {query}"
+          ]
+        }
+      ],
+      "types": []
+    }
+  }
+}

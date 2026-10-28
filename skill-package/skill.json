@@ -1,0 +1,26 @@
+{
+  "manifest": {
+    "publishingInformation": {
+      "locales": {
+        "pt-BR": {
+          "summary": "Converse com uma IA avancada pela voz, com memoria.",
+          "examplePhrases": [
+            "Alexa, ativar modo super",
+            "Alexa, abrir modo super",
+            "Alexa, iniciar modo super"
+          ],
+          "name": "Modo Super",
+          "description": "Assistente de conversa com inteligencia artificial e memoria. Faca perguntas, peca explicacoes e continue a conversa. Diga nova conversa para apagar a memoria."
+        }
+      },
+      "isAvailableWorldwide": true,
+      "testingInstructions": "Abra a skill e faca uma pergunta, ex: me explique o que e fotossintese. Diga nova conversa para limpar a memoria.",
+      "category": "KNOWLEDGE_AND_TRIVIA",
+      "distributionCountries": []
+    },
+    "apis": {
+      "custom": {}
+    },
+    "manifestVersion": "1.0"
+  }
+}
