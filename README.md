@@ -7,10 +7,11 @@ Voz -> Alexa (ASR) -> Lambda -> Groq -> texto -> Alexa (TTS) -> voz
 ```
 
 ## Como usar
-- Abrir: **"Alexa, ativar modo super"** (invocação: `modo super`; "Alexa" não é permitido no nome de invocação).
-- Perguntar: comece a frase com um verbo/pergunta: *"me explique..."*, *"me diga..."*, *"quero saber..."*, *"o que é..."*, *"como..."*, *"quem é..."*. A Alexa não aceita falas 100% livres, por isso o modelo usa essas frases-gatilho (ver `skill-package/interactionModels/custom/pt-BR.json`; adicione mais à vontade).
+- Abrir: **"Alexa, abrir modo super"** (invocação: `modo super`; "Alexa" não é permitido no nome de invocação).
+- Conversar: você pode falar naturalmente ou começar com frases como *"me explique..."*, *"quero saber..."*, *"o que é..."*, *"sobre..."*, *"e..."*. O modelo possui tanto frases-gatilho quanto um modo pega-tudo (`CatchAllIntent`) que envia falas curtas ou soltas direto ao LLM.
+- Pesquisar na web: diga **"pesquise na internet sobre..."** ou faça perguntas sobre fatos de hoje/notícias. Se o modelo não souber algo na resposta rápida, ele também tenta pesquisar automaticamente se houver tempo.
 - A skill mantém o microfone aberto após cada resposta; fica em silêncio ~8s e a sessão fecha, mas o histórico continua salvo.
-- Limpar memória: **"nova conversa"**, **"limpar memória"**, **"apagar histórico"**, **"esquecer tudo"**, **"zerar memória"**. Também funciona se dito dentro de uma pergunta (interceptação de texto).
+- Limpar memória: **"nova conversa"**, **"limpar memória"**, **"apagar histórico"**, **"esquecer tudo"**, **"zerar memória"**.
 - Sair: **"parar"**.
 
 ## Estrutura

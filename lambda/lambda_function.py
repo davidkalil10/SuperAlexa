@@ -45,8 +45,42 @@ MAX_STORED_BYTES = int(os.environ.get("MAX_STORED_BYTES", str(300 * 1024)))
 CONTEXT_CHAR_BUDGET = int(os.environ.get("CONTEXT_CHAR_BUDGET", "12000"))
 MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "500"))
 # A Alexa derruba a resposta apos ~8s; deixamos margem.
-TOTAL_BUDGET_SECONDS = float(os.environ.get("AI_TOTAL_BUDGET", "7.0"))
+TOTAL_BUDGET_SECONDS = float(os.environ.get("AI_TOTAL_BUDGET", "7.2"))
 MAX_SPEECH_CHARS = 1500
+
+# Busca na web (browser_search embutido no Groq para gpt-oss). Gasta MUITO mais tokens e tempo
+# (~6s e ~14k tokens por pergunta), entao so e usada sob demanda ou quando a resposta normal falha.
+SEARCH_MODEL = os.environ.get("AI_SEARCH_MODEL", "openai/gpt-oss-120b")
+SEARCH_ENABLED = os.environ.get("AI_SEARCH_ENABLED", "1") != "0"
+SEARCH_MIN_SECONDS = 3.0  # nao inicia uma busca com menos tempo que isso restante
+SEARCH_MAX_TOKENS = int(os.environ.get("AI_SEARCH_MAX_TOKENS", "700"))
+SEARCH_PROMPT = (
+    "Nesta resposta voce TEM acesso a busca na web. Use-a para fatos, pessoas, noticias e dados atuais. "
+    "Responda curto (2 a 4 frases), em portugues, sem citacoes, sem links e sem markdown. "
+    "Se mesmo pesquisando nao encontrar, diga isso com honestidade."
+)
+# Prefixos que ligam a busca explicitamente ("pesquise na internet sobre X").
+SEARCH_PREFIXES = (
+    "pesquise na internet sobre", "pesquise na internet", "pesquise na web sobre", "pesquise na web",
+    "pesquisa na internet sobre", "pesquisa na internet", "busque na internet sobre", "busque na internet",
+    "busque na web", "procure na internet sobre", "procure na internet", "procure na web",
+    "pesquise sobre", "pesquise", "pesquisa sobre", "busque sobre", "busque", "procure sobre",
+    "procure", "pesquisar", "procurar", "buscar",
+)
+# Assuntos que dependem de dados atuais: vao direto para a busca.
+REALTIME_HINTS = (
+    "hoje", "agora", "atualmente", "ultimas noticias", "noticias", "noticia", "cotacao",
+    "previsao do tempo", "placar", "quem ganhou", "resultado do jogo", "ultimo jogo",
+)
+# Sinais de que a resposta normal nao sabe: dispara busca automatica se houver tempo.
+UNSURE_HINTS = (
+    "nao tenho informacao", "nao tenho informacoes", "nao tenho dados", "nao tenho certeza",
+    "nao conheco", "nao sei", "nao possuo informacao", "nao tenho acesso", "nao encontrei",
+    "nao consigo confirmar", "nao tenho como confirmar", "nao disponho",
+)
+# Cooldown de modelos com 429 (persiste enquanto o Lambda estiver "quente").
+_cooldown_until = {}
+DEFAULT_COOLDOWN = 60.0
 
 SYSTEM_PROMPT = (
     "Voce e a Super Alexa, uma assistente de voz inteligente, simpatica e direta. "
@@ -129,6 +163,9 @@ def is_reset_command(text):
 def clean_for_speech(text):
     """Remove markdown/emojis e escapa para SSML."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    text = re.sub(r"\u3010[^\u3011]*\u3011", "", text)  # citacoes da busca: 【2†L0-L1】
+    text = re.sub(r"\[?\d+†[^\s\]]+\]?", "", text)
+    text = re.sub(r"\[\d+\]", "", text)
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"[*_#`>~|]+", "", text)
@@ -149,13 +186,16 @@ class AIError(Exception):
     pass
 
 
-def _post_chat(model, messages, api_key, timeout):
+def _post_chat(model, messages, api_key, timeout, search=False):
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": SEARCH_MAX_TOKENS if search else MAX_TOKENS,
         "temperature": 0.7,
     }
+    if search:
+        payload["tools"] = [{"type": "browser_search"}]
+        payload["tool_choice"] = "auto"
     req = urllib.request.Request(
         f"{BASE_URL}/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -174,24 +214,65 @@ def _post_chat(model, messages, api_key, timeout):
     return content
 
 
-def ask_ai(history, user_text):
-    """Tenta cada modelo da cascata dentro do orcamento de tempo da Alexa."""
+def _in_cooldown(model):
+    return _cooldown_until.get(model, 0) > time.monotonic()
+
+
+def _start_cooldown(model, http_error):
+    """429: marca o modelo como indisponivel por um tempo (respeita Retry-After, max 5 min)."""
+    wait = DEFAULT_COOLDOWN
+    try:
+        wait = min(float(http_error.headers.get("retry-after", DEFAULT_COOLDOWN)), 300.0)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    _cooldown_until[model] = time.monotonic() + wait
+    logger.warning("Modelo %s em cooldown por %.0fs (429)", model, wait)
+
+
+def _search_key(model):
+    return model + "#search"
+
+
+def ask_ai(history, user_text, search=False, deadline=None):
+    """Chama a IA. Sem busca: cascata de modelos. Com busca: so o modelo de busca.
+
+    429 poe o modelo em cooldown e passa ao proximo; 403/5xx/rede tambem passam ao proximo.
+    Tudo dentro do orcamento de tempo da Alexa (deadline).
+    """
     api_key = _load_api_key()
     if not api_key:
         raise AIError("NO_KEY")
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [
-        {"role": "user", "content": user_text}
+    system = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if search:
+        system.append({"role": "system", "content": SEARCH_PROMPT})
+    messages = system + history + [{"role": "user", "content": user_text}]
+    deadline = deadline or (time.monotonic() + TOTAL_BUDGET_SECONDS)
+
+    candidates = [SEARCH_MODEL] if search else list(MODELS)
+    keyf = _search_key if search else (lambda m: m)
+    # Modelos em cooldown vao para o fim da fila (so usados se nada mais restar).
+    candidates = [m for m in candidates if not _in_cooldown(keyf(m))] + [
+        m for m in candidates if _in_cooldown(keyf(m))
     ]
-    deadline = time.monotonic() + TOTAL_BUDGET_SECONDS
+    if search:
+        candidates = [m for m in candidates if not _in_cooldown(keyf(m))]
+
     last_err = None
     timed_out = False
-    for model in MODELS:
+    for model in candidates:
         remaining = deadline - time.monotonic()
-        if remaining < 1.0:
+        if remaining < (SEARCH_MIN_SECONDS if search else 1.0):
             break
         try:
-            return _post_chat(model, messages, api_key, timeout=min(remaining, 6.0))
+            return _post_chat(model, messages, api_key, timeout=remaining if search else min(remaining, 6.0), search=search)
+        except urllib.error.HTTPError as e:  # antes de URLError (e subclasse)
+            last_err = e
+            if e.code == 429:
+                _start_cooldown(keyf(model), e)
+            elif e.code in (400, 404) and search:
+                _cooldown_until[keyf(model)] = time.monotonic() + 600  # busca indisponivel neste modelo
+            logger.warning("Modelo %s HTTP %s", model, e.code)
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             timed_out = timed_out or "timed out" in str(e).lower()
             last_err = e
@@ -200,6 +281,30 @@ def ask_ai(history, user_text):
             last_err = e
             logger.warning("Modelo %s resposta invalida: %s", model, e)
     raise AIError("TIMEOUT" if timed_out else f"FAILED: {last_err}")
+
+
+def parse_search_command(text):
+    """Retorna (consulta, busca_explicita). 'pesquise na internet sobre X' -> ('X', True)."""
+    norm = _normalize(text)
+    for prefix in SEARCH_PREFIXES:
+        if norm == prefix:
+            return text, False
+        if norm.startswith(prefix + " "):
+            # remove o prefixo do texto original preservando acentos/maiusculas
+            words = len(prefix.split())
+            rest = " ".join(text.split()[words:]).strip()
+            return (rest or text), True
+    return text, False
+
+
+def looks_realtime(text):
+    padded = " " + _normalize(text) + " "
+    return any(" " + h + " " in padded for h in REALTIME_HINTS)
+
+
+def seems_unsure(answer):
+    norm = _normalize(answer)
+    return any(h in norm for h in UNSURE_HINTS)
 
 
 # ----------------------------------------------------------------------------
@@ -276,8 +381,28 @@ def _converse(handler_input, text):
         return _ask(handler_input, MSG_RESET)
 
     history = get_history(handler_input)
+    context = select_context(history)
+    deadline = time.monotonic() + TOTAL_BUDGET_SECONDS
+    query, explicit_search = parse_search_command(text)
+    answer = None
     try:
-        answer = ask_ai(select_context(history), text)
+        # 1) Busca direta: pedido explicito ("pesquise...") ou assunto que exige dado atual.
+        if SEARCH_ENABLED and (explicit_search or looks_realtime(query)):
+            try:
+                answer = ask_ai(context, query, search=True, deadline=deadline)
+            except AIError as e:
+                if str(e) == "NO_KEY":
+                    raise
+                logger.warning("Busca falhou (%s); usando resposta normal.", e)
+        # 2) Resposta normal (cascata de modelos).
+        if answer is None:
+            answer = ask_ai(context, query, deadline=deadline)
+            # 3) Se a resposta admite que nao sabe e ainda ha tempo, tenta com busca.
+            if SEARCH_ENABLED and seems_unsure(answer) and deadline - time.monotonic() >= SEARCH_MIN_SECONDS:
+                try:
+                    answer = ask_ai(context, query, search=True, deadline=deadline)
+                except AIError as e:
+                    logger.warning("Busca automatica falhou (%s); mantendo resposta normal.", e)
     except AIError as e:
         logger.error("Falha na IA: %s", e)
         msg = MSG_NO_KEY if str(e) == "NO_KEY" else (MSG_TIMEOUT if str(e) == "TIMEOUT" else MSG_ERROR)
