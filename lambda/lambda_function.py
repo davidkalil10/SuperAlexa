@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Super Alexa - Custom Skill que conversa com uma IA (Groq, API compativel com OpenAI)
-e mantem memoria da conversa no DynamoDB (persistent attributes).
+"""Super Alexa - Custom Skill que conversa com uma IA (Groq, API compativel com OpenAI),
+enriquecida automaticamente com busca na web (DuckDuckGo Lite) e memoria no DynamoDB.
 
-Fluxo: Alexa (voz->texto) -> este Lambda -> Groq -> texto -> Alexa (texto->voz).
+Fluxo: Alexa (voz->texto) -> este Lambda (busca web + Groq) -> texto -> Alexa (texto->voz).
 """
+import html
 import json
 import logging
 import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from xml.sax.saxutils import escape
 
@@ -28,7 +30,6 @@ logger.setLevel(logging.INFO)
 # Configuracao
 # ----------------------------------------------------------------------------
 BASE_URL = os.environ.get("AI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
-# Mesma cascata de modelos usada no Auto News Watch (sobrescreva com AI_MODELS="a,b,c").
 DEFAULT_MODELS = [
     "openai/gpt-oss-120b",
     "qwen/qwen3.8-27b",
@@ -40,44 +41,18 @@ MODELS = [m.strip() for m in os.environ.get("AI_MODELS", "").split(",") if m.str
 # Memoria: guardamos TUDO no DynamoDB ate este teto de bytes (item maximo = 400 KB);
 # so ao estourar o teto descartamos as mensagens mais antigas.
 MAX_STORED_BYTES = int(os.environ.get("MAX_STORED_BYTES", str(300 * 1024)))
-# Para a IA enviamos apenas as mensagens mais recentes que cabem neste orcamento de caracteres
-# (evita estourar contexto/cota e mantem a resposta rapida).
+# Para a IA enviamos apenas as mensagens mais recentes que cabem neste orcamento de caracteres.
 CONTEXT_CHAR_BUDGET = int(os.environ.get("CONTEXT_CHAR_BUDGET", "12000"))
 MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "500"))
 # A Alexa derruba a resposta apos ~8s; deixamos margem.
 TOTAL_BUDGET_SECONDS = float(os.environ.get("AI_TOTAL_BUDGET", "7.2"))
 MAX_SPEECH_CHARS = 1500
 
-# Busca na web (browser_search embutido no Groq para gpt-oss). Gasta MUITO mais tokens e tempo
-# (~6s e ~14k tokens por pergunta), entao so e usada sob demanda ou quando a resposta normal falha.
-SEARCH_MODEL = os.environ.get("AI_SEARCH_MODEL", "openai/gpt-oss-120b")
-SEARCH_ENABLED = os.environ.get("AI_SEARCH_ENABLED", "1") != "0"
-SEARCH_MIN_SECONDS = 3.0  # nao inicia uma busca com menos tempo que isso restante
-SEARCH_MAX_TOKENS = int(os.environ.get("AI_SEARCH_MAX_TOKENS", "700"))
-SEARCH_PROMPT = (
-    "Nesta resposta voce TEM acesso a busca na web. Use-a para fatos, pessoas, noticias e dados atuais. "
-    "Responda curto (2 a 4 frases), em portugues, sem citacoes, sem links e sem markdown. "
-    "Se mesmo pesquisando nao encontrar, diga isso com honestidade."
-)
-# Prefixos que ligam a busca explicitamente ("pesquise na internet sobre X").
-SEARCH_PREFIXES = (
-    "pesquise na internet sobre", "pesquise na internet", "pesquise na web sobre", "pesquise na web",
-    "pesquisa na internet sobre", "pesquisa na internet", "busque na internet sobre", "busque na internet",
-    "busque na web", "procure na internet sobre", "procure na internet", "procure na web",
-    "pesquise sobre", "pesquise", "pesquisa sobre", "busque sobre", "busque", "procure sobre",
-    "procure", "pesquisar", "procurar", "buscar",
-)
-# Assuntos que dependem de dados atuais: vao direto para a busca.
-REALTIME_HINTS = (
-    "hoje", "agora", "atualmente", "ultimas noticias", "noticias", "noticia", "cotacao",
-    "previsao do tempo", "placar", "quem ganhou", "resultado do jogo", "ultimo jogo",
-)
-# Sinais de que a resposta normal nao sabe: dispara busca automatica se houver tempo.
-UNSURE_HINTS = (
-    "nao tenho informacao", "nao tenho informacoes", "nao tenho dados", "nao tenho certeza",
-    "nao conheco", "nao sei", "nao possuo informacao", "nao tenho acesso", "nao encontrei",
-    "nao consigo confirmar", "nao tenho como confirmar", "nao disponho",
-)
+# Busca web automatica por baixo dos panos (DuckDuckGo Lite, ~0.4s, zero gasto de cota da IA).
+WEB_SEARCH_ENABLED = os.environ.get("AI_SEARCH_ENABLED", "1") != "0"
+WEB_SEARCH_TIMEOUT = float(os.environ.get("AI_WEB_SEARCH_TIMEOUT", "2.2"))
+WEB_SEARCH_MAX_RESULTS = int(os.environ.get("AI_WEB_SEARCH_RESULTS", "5"))
+
 # Cooldown de modelos com 429 (persiste enquanto o Lambda estiver "quente").
 _cooldown_until = {}
 DEFAULT_COOLDOWN = 60.0
@@ -88,12 +63,15 @@ SYSTEM_PROMPT = (
     "(no maximo 3 ou 4 frases, a menos que o usuario peca mais detalhes). "
     "NAO use markdown, listas com marcadores, asteriscos, emojis, tabelas ou links. "
     "Se precisar enumerar, use frases corridas. Use o historico da conversa para manter o contexto. "
-    "Se a fala do usuario parecer curta ou incompleta (uma palavra, um nome, 'e ele?'), trate como "
-    "continuacao do assunto anterior. "
-    "NUNCA invente fatos. Se nao conhecer uma pessoa, empresa, jogo ou assunto especifico, ou nao tiver "
-    "certeza, diga com honestidade que nao tem informacao confiavel sobre isso e peca mais detalhes. "
-    "Voce nao tem acesso a internet nem a fontes em tempo real; se perguntarem de onde veio uma informacao, "
-    "explique que vem do seu treinamento e pode estar desatualizada ou incorreta. "
+    "IMPORTANTE SOBRE FRASES CORTADAS E CONTINUACOES: A Alexa as vezes remove a primeira palavra da frase "
+    "do usuario (como 'é um', 'pesquise', 'quero saber', 'sobre', 'como') ou o usuario responde com uma "
+    "palavra solta ou complemento curto (ex: 'Ronin', 'um jogo j2me', 'e ele?'). Sempre reconstrua o sentido "
+    "naturalmente combinando com o assunto da conversa anterior! "
+    "IMPORTANTE SOBRE PESQUISA NA WEB: Junto com a fala do usuario, voce recebera trechos de pesquisa na web "
+    "atualizados entre colchetes. Use esses dados para responder sobre fatos recentes, eleicoes, noticias, "
+    "pessoas, empresas ou jogos especificos com precisao, como se voce mesma tivesse pesquisado. "
+    "Se os resultados da web nao tiverem nada util sobre uma pessoa ou assunto muito especifico e voce nao "
+    "tiver certeza absoluta, diga com honestidade que nao encontrou informacao confiavel e peca mais detalhes. "
     "Voce NAO controla dispositivos, musicas, alarmes ou casa inteligente; se pedirem isso, "
     "explique gentilmente que nesta skill voce so conversa."
 )
@@ -116,9 +94,8 @@ STOP_WORDS = {"parar", "para", "pare", "sair", "tchau", "cancelar", "cancela", "
 HELP_WORDS = {"ajuda", "me ajuda", "socorro"}
 MSG_REPROMPT = "Pode continuar, estou ouvindo."
 MSG_HELP = (
-    "Eu sou uma assistente com inteligencia artificial. Faca qualquer pergunta, por exemplo: "
-    "me explique como funciona um buraco negro. Para apagar minha memoria, diga: nova conversa. "
-    "Para sair, diga: parar."
+    "Eu sou uma assistente com inteligencia artificial e acesso a pesquisa na web. Faca qualquer pergunta "
+    "e continue a conversa normalmente. Para apagar minha memoria, diga: nova conversa. Para sair, diga: parar."
 )
 MSG_RESET = "Pronto, apaguei a memoria. Vamos comecar uma nova conversa!"
 MSG_BYE = "Ate logo!"
@@ -131,7 +108,6 @@ def _load_api_key():
     key = os.environ.get("GROQ_API_KEY") or os.environ.get("AI_API_KEY")
     if key:
         return key.strip()
-    # Alexa-hosted nao permite variaveis de ambiente: use lambda/secrets.json (fora do git).
     path = os.path.join(os.path.dirname(__file__), "secrets.json")
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -161,9 +137,9 @@ def is_reset_command(text):
 
 
 def clean_for_speech(text):
-    """Remove markdown/emojis e escapa para SSML."""
+    """Remove markdown/emojis/citacoes e escapa para SSML."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
-    text = re.sub(r"\u3010[^\u3011]*\u3011", "", text)  # citacoes da busca: 【2†L0-L1】
+    text = re.sub(r"\u3010[^\u3011]*\u3011", "", text)
     text = re.sub(r"\[?\d+†[^\s\]]+\]?", "", text)
     text = re.sub(r"\[\d+\]", "", text)
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
@@ -180,22 +156,84 @@ def clean_for_speech(text):
 
 
 # ----------------------------------------------------------------------------
+# Pesquisa na Web Automatica (DuckDuckGo Lite - rapida e gratuita)
+# ----------------------------------------------------------------------------
+STRIP_SEARCH_WORDS = (
+    "pesquise na internet sobre ", "pesquise na internet ", "pesquise na web sobre ", "pesquise na web ",
+    "na internet sobre ", "na internet ", "na web sobre ", "na web ",
+    "pesquise sobre ", "pesquise ", "busque sobre ", "busque ", "procure sobre ", "procure ",
+    "quero saber sobre ", "quero saber ", "me fale sobre ", "fale sobre ", "me diga sobre ", "me explique ",
+)
+
+
+def build_search_query(history, user_text):
+    """Monta a consulta de pesquisa combinando o contexto recente quando a fala e curta."""
+    def _clean(t):
+        t = (t or "").strip()
+        low = _normalize(t)
+        for prefix in STRIP_SEARCH_WORDS:
+            if low.startswith(prefix):
+                w = len(prefix.strip().split())
+                t = " ".join(t.split()[w:]).strip() or t
+                break
+        return t
+
+    q = _clean(user_text)
+    # Se a fala atual for curta (ate 6 palavras) e houver conversa anterior, junta com os ultimos 2 topicos do usuario
+    if len(q.split()) <= 6 and history:
+        prev_users = [_clean(m.get("content", "")) for m in history if m.get("role") == "user"]
+        if prev_users:
+            recent = " ".join(prev_users[-2:])
+            q = f"{recent} {q}".strip()
+    return q[:180]
+
+
+def fetch_web_snippets(query, timeout=WEB_SEARCH_TIMEOUT, max_results=WEB_SEARCH_MAX_RESULTS):
+    """Busca trechos atualizados no DuckDuckGo Lite (~0.4s) sem consumir cota do Groq."""
+    if not WEB_SEARCH_ENABLED or not query or len(query.strip()) < 2:
+        return ""
+    try:
+        url = "https://lite.duckduckgo.com/lite/"
+        data = urllib.parse.urlencode({"q": query}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+        titles = re.findall(r"<a rel=\"nofollow\" href=\"[^\"]+\" class='result-link'>(.*?)</a>", raw, re.S)
+        snippets = re.findall(r"<td class='result-snippet'>(.*?)</td>", raw, re.S)
+        out = []
+        for idx, s in enumerate(snippets[:max_results]):
+            t_clean = html.unescape(re.sub(r"<[^>]+>", "", titles[idx])).strip() if idx < len(titles) else ""
+            s_clean = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", s))).strip()
+            if s_clean:
+                out.append(f"- {t_clean}: {s_clean}" if t_clean else f"- {s_clean}")
+        return "\n".join(out)
+    except Exception as e:
+        logger.warning("Busca web DuckDuckGo falhou (%s): %s", query, e)
+        return ""
+
+
+# ----------------------------------------------------------------------------
 # Cliente da IA (OpenAI-compatible)
 # ----------------------------------------------------------------------------
 class AIError(Exception):
     pass
 
 
-def _post_chat(model, messages, api_key, timeout, search=False):
+def _post_chat(model, messages, api_key, timeout):
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": SEARCH_MAX_TOKENS if search else MAX_TOKENS,
-        "temperature": 0.7,
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0.5,
     }
-    if search:
-        payload["tools"] = [{"type": "browser_search"}]
-        payload["tool_choice"] = "auto"
     req = urllib.request.Request(
         f"{BASE_URL}/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -229,49 +267,46 @@ def _start_cooldown(model, http_error):
     logger.warning("Modelo %s em cooldown por %.0fs (429)", model, wait)
 
 
-def _search_key(model):
-    return model + "#search"
-
-
-def ask_ai(history, user_text, search=False, deadline=None):
-    """Chama a IA. Sem busca: cascata de modelos. Com busca: so o modelo de busca.
-
-    429 poe o modelo em cooldown e passa ao proximo; 403/5xx/rede tambem passam ao proximo.
-    Tudo dentro do orcamento de tempo da Alexa (deadline).
-    """
+def ask_ai(history, user_text, **kwargs):
+    """Enriquece a pergunta com pesquisa na web por baixo dos panos e chama a cascata do Groq."""
     api_key = _load_api_key()
     if not api_key:
         raise AIError("NO_KEY")
 
-    system = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if search:
-        system.append({"role": "system", "content": SEARCH_PROMPT})
-    messages = system + history + [{"role": "user", "content": user_text}]
-    deadline = deadline or (time.monotonic() + TOTAL_BUDGET_SECONDS)
+    deadline = kwargs.get("deadline") or (time.monotonic() + TOTAL_BUDGET_SECONDS)
 
-    candidates = [SEARCH_MODEL] if search else list(MODELS)
-    keyf = _search_key if search else (lambda m: m)
-    # Modelos em cooldown vao para o fim da fila (so usados se nada mais restar).
-    candidates = [m for m in candidates if not _in_cooldown(keyf(m))] + [
-        m for m in candidates if _in_cooldown(keyf(m))
+    # Fazemos a pesquisa rapida na web por baixo dos panos em toda pergunta
+    search_query = build_search_query(history, user_text)
+    web_snippets = ""
+    if WEB_SEARCH_ENABLED and (deadline - time.monotonic()) > 3.5:
+        web_snippets = fetch_web_snippets(search_query, timeout=min(WEB_SEARCH_TIMEOUT, deadline - time.monotonic() - 2.0))
+
+    augmented_user = user_text
+    if web_snippets:
+        augmented_user = (
+            f"Fala do usuario (pode ter tido a primeira palavra cortada pela Alexa): \"{user_text}\"\n\n"
+            f"[Resultados de pesquisa na web para \"{search_query}\":\n{web_snippets}]"
+        )
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [
+        {"role": "user", "content": augmented_user}
     ]
-    if search:
-        candidates = [m for m in candidates if not _in_cooldown(keyf(m))]
+
+    # Modelos fora de cooldown primeiro; em cooldown no fim como ultimo recurso.
+    candidates = [m for m in MODELS if not _in_cooldown(m)] + [m for m in MODELS if _in_cooldown(m)]
 
     last_err = None
     timed_out = False
     for model in candidates:
         remaining = deadline - time.monotonic()
-        if remaining < (SEARCH_MIN_SECONDS if search else 1.0):
+        if remaining < 0.8:
             break
         try:
-            return _post_chat(model, messages, api_key, timeout=remaining if search else min(remaining, 6.0), search=search)
-        except urllib.error.HTTPError as e:  # antes de URLError (e subclasse)
+            return _post_chat(model, messages, api_key, timeout=min(remaining, 5.5))
+        except urllib.error.HTTPError as e:
             last_err = e
             if e.code == 429:
-                _start_cooldown(keyf(model), e)
-            elif e.code in (400, 404) and search:
-                _cooldown_until[keyf(model)] = time.monotonic() + 600  # busca indisponivel neste modelo
+                _start_cooldown(model, e)
             logger.warning("Modelo %s HTTP %s", model, e.code)
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             timed_out = timed_out or "timed out" in str(e).lower()
@@ -281,30 +316,6 @@ def ask_ai(history, user_text, search=False, deadline=None):
             last_err = e
             logger.warning("Modelo %s resposta invalida: %s", model, e)
     raise AIError("TIMEOUT" if timed_out else f"FAILED: {last_err}")
-
-
-def parse_search_command(text):
-    """Retorna (consulta, busca_explicita). 'pesquise na internet sobre X' -> ('X', True)."""
-    norm = _normalize(text)
-    for prefix in SEARCH_PREFIXES:
-        if norm == prefix:
-            return text, False
-        if norm.startswith(prefix + " "):
-            # remove o prefixo do texto original preservando acentos/maiusculas
-            words = len(prefix.split())
-            rest = " ".join(text.split()[words:]).strip()
-            return (rest or text), True
-    return text, False
-
-
-def looks_realtime(text):
-    padded = " " + _normalize(text) + " "
-    return any(" " + h + " " in padded for h in REALTIME_HINTS)
-
-
-def seems_unsure(answer):
-    norm = _normalize(answer)
-    return any(h in norm for h in UNSURE_HINTS)
 
 
 # ----------------------------------------------------------------------------
@@ -330,7 +341,7 @@ def trim_for_storage(history):
             break
         keep_from = i
     history = history[keep_from:]
-    while history and history[0].get("role") != "user":  # nao comeca no meio de uma troca
+    while history and history[0].get("role") != "user":
         history = history[1:]
     return history
 
@@ -344,7 +355,7 @@ def select_context(history):
             break
         chosen.append(msg)
     chosen.reverse()
-    while chosen and chosen[0].get("role") != "user":  # comeca sempre numa fala do usuario
+    while chosen and chosen[0].get("role") != "user":
         chosen.pop(0)
     return chosen
 
@@ -365,9 +376,7 @@ def clear_history(handler_input):
 # Handlers
 # ----------------------------------------------------------------------------
 def _ask(handler_input, speech, reprompt=MSG_REPROMPT):
-    return (
-        handler_input.response_builder.speak(speech).ask(reprompt).response
-    )
+    return handler_input.response_builder.speak(speech).ask(reprompt).response
 
 
 def _converse(handler_input, text):
@@ -376,33 +385,19 @@ def _converse(handler_input, text):
     if not text:
         return _ask(handler_input, "Nao entendi. Pode repetir?")
 
+    norm = _normalize(text)
+    if norm in STOP_WORDS:
+        return handler_input.response_builder.speak(MSG_BYE).set_should_end_session(True).response
+    if norm in HELP_WORDS:
+        return _ask(handler_input, MSG_HELP)
     if is_reset_command(text):
         clear_history(handler_input)
         return _ask(handler_input, MSG_RESET)
 
     history = get_history(handler_input)
     context = select_context(history)
-    deadline = time.monotonic() + TOTAL_BUDGET_SECONDS
-    query, explicit_search = parse_search_command(text)
-    answer = None
     try:
-        # 1) Busca direta: pedido explicito ("pesquise...") ou assunto que exige dado atual.
-        if SEARCH_ENABLED and (explicit_search or looks_realtime(query)):
-            try:
-                answer = ask_ai(context, query, search=True, deadline=deadline)
-            except AIError as e:
-                if str(e) == "NO_KEY":
-                    raise
-                logger.warning("Busca falhou (%s); usando resposta normal.", e)
-        # 2) Resposta normal (cascata de modelos).
-        if answer is None:
-            answer = ask_ai(context, query, deadline=deadline)
-            # 3) Se a resposta admite que nao sabe e ainda ha tempo, tenta com busca.
-            if SEARCH_ENABLED and seems_unsure(answer) and deadline - time.monotonic() >= SEARCH_MIN_SECONDS:
-                try:
-                    answer = ask_ai(context, query, search=True, deadline=deadline)
-                except AIError as e:
-                    logger.warning("Busca automatica falhou (%s); mantendo resposta normal.", e)
+        answer = ask_ai(context, text)
     except AIError as e:
         logger.error("Falha na IA: %s", e)
         msg = MSG_NO_KEY if str(e) == "NO_KEY" else (MSG_TIMEOUT if str(e) == "TIMEOUT" else MSG_ERROR)
@@ -441,12 +436,6 @@ class CatchAllIntentHandler(AbstractRequestHandler):
 
     def handle(self, handler_input):
         text = ask_utils.get_slot_value(handler_input, "text")
-        norm = _normalize(text)
-        # O pega-tudo pode capturar comandos basicos: tratamos aqui.
-        if norm in STOP_WORDS:
-            return handler_input.response_builder.speak(MSG_BYE).set_should_end_session(True).response
-        if norm in HELP_WORDS:
-            return _ask(handler_input, MSG_HELP)
         return _converse(handler_input, text)
 
 
@@ -484,7 +473,7 @@ class FallbackIntentHandler(AbstractRequestHandler):
     def handle(self, handler_input):
         return _ask(
             handler_input,
-            "Nao entendi. Fale de novo comecando com sobre, e, me diga ou quero saber.",
+            "Nao consegui ouvir direito. Pode repetir comecando com: me diga, ou quero saber?",
         )
 
 
