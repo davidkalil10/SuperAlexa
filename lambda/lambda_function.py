@@ -54,6 +54,12 @@ SYSTEM_PROMPT = (
     "(no maximo 3 ou 4 frases, a menos que o usuario peca mais detalhes). "
     "NAO use markdown, listas com marcadores, asteriscos, emojis, tabelas ou links. "
     "Se precisar enumerar, use frases corridas. Use o historico da conversa para manter o contexto. "
+    "Se a fala do usuario parecer curta ou incompleta (uma palavra, um nome, 'e ele?'), trate como "
+    "continuacao do assunto anterior. "
+    "NUNCA invente fatos. Se nao conhecer uma pessoa, empresa, jogo ou assunto especifico, ou nao tiver "
+    "certeza, diga com honestidade que nao tem informacao confiavel sobre isso e peca mais detalhes. "
+    "Voce nao tem acesso a internet nem a fontes em tempo real; se perguntarem de onde veio uma informacao, "
+    "explique que vem do seu treinamento e pode estar desatualizada ou incorreta. "
     "Voce NAO controla dispositivos, musicas, alarmes ou casa inteligente; se pedirem isso, "
     "explique gentilmente que nesta skill voce so conversa."
 )
@@ -334,7 +340,7 @@ class FallbackIntentHandler(AbstractRequestHandler):
     def handle(self, handler_input):
         return _ask(
             handler_input,
-            "Nao consegui entender. Tente comecar com: me explique, me diga, quero saber ou o que e.",
+            "Nao entendi. Fale de novo comecando com sobre, e, me diga ou quero saber.",
         )
 
 
