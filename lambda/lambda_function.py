@@ -37,7 +37,12 @@ DEFAULT_MODELS = [
 ]
 MODELS = [m.strip() for m in os.environ.get("AI_MODELS", "").split(",") if m.strip()] or DEFAULT_MODELS
 
-MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "20"))  # 10 trocas
+# Memoria: guardamos TUDO no DynamoDB ate este teto de bytes (item maximo = 400 KB);
+# so ao estourar o teto descartamos as mensagens mais antigas.
+MAX_STORED_BYTES = int(os.environ.get("MAX_STORED_BYTES", str(300 * 1024)))
+# Para a IA enviamos apenas as mensagens mais recentes que cabem neste orcamento de caracteres
+# (evita estourar contexto/cota e mantem a resposta rapida).
+CONTEXT_CHAR_BUDGET = int(os.environ.get("CONTEXT_CHAR_BUDGET", "12000"))
 MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "500"))
 # A Alexa derruba a resposta apos ~8s; deixamos margem.
 TOTAL_BUDGET_SECONDS = float(os.environ.get("AI_TOTAL_BUDGET", "7.0"))
@@ -197,10 +202,44 @@ def get_history(handler_input):
     return list(attrs.get("history", []))
 
 
+def _size(messages):
+    return len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
+
+
+def trim_for_storage(history):
+    """Descarta as mensagens mais antigas somente se passar do teto de bytes."""
+    if _size(history) <= MAX_STORED_BYTES:
+        return history
+    total, keep_from = 2, len(history)
+    for i in range(len(history) - 1, -1, -1):
+        total += _size(history[i]) + 2
+        if total > MAX_STORED_BYTES:
+            break
+        keep_from = i
+    history = history[keep_from:]
+    while history and history[0].get("role") != "user":  # nao comeca no meio de uma troca
+        history = history[1:]
+    return history
+
+
+def select_context(history):
+    """Pega as mensagens mais recentes que cabem no orcamento de caracteres enviado a IA."""
+    chosen, total = [], 0
+    for msg in reversed(history):
+        total += len(msg.get("content", ""))
+        if total > CONTEXT_CHAR_BUDGET and chosen:
+            break
+        chosen.append(msg)
+    chosen.reverse()
+    while chosen and chosen[0].get("role") != "user":  # comeca sempre numa fala do usuario
+        chosen.pop(0)
+    return chosen
+
+
 def save_history(handler_input, history):
     mgr = handler_input.attributes_manager
     attrs = mgr.persistent_attributes
-    attrs["history"] = history[-MAX_HISTORY_MESSAGES:]
+    attrs["history"] = trim_for_storage(history)
     mgr.persistent_attributes = attrs
     mgr.save_persistent_attributes()
 
@@ -230,7 +269,7 @@ def _converse(handler_input, text):
 
     history = get_history(handler_input)
     try:
-        answer = ask_ai(history, text)
+        answer = ask_ai(select_context(history), text)
     except AIError as e:
         logger.error("Falha na IA: %s", e)
         msg = MSG_NO_KEY if str(e) == "NO_KEY" else (MSG_TIMEOUT if str(e) == "TIMEOUT" else MSG_ERROR)

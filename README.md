@@ -38,7 +38,8 @@ skill-package/interactionModels/custom/pt-BR.json
 |---|---|
 | `AI_BASE_URL` | `https://api.groq.com/openai/v1` (troque para qualquer API OpenAI-compatível) |
 | `AI_MODELS` | `openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b,allam-2-7b` (cascata de fallback) |
-| `MAX_HISTORY_MESSAGES` | `20` (10 trocas) |
+| `MAX_STORED_BYTES` | `307200` (300 KB: guarda tudo no DynamoDB; só descarta as mais antigas ao passar do teto) |
+| `CONTEXT_CHAR_BUDGET` | `12000` (só as mensagens mais recentes que cabem nisso vão para a IA) |
 | `AI_MAX_TOKENS` | `500` |
 | `AI_TOTAL_BUDGET` | `7.0` s (a Alexa corta em ~8s) |
 
