@@ -2,6 +2,51 @@
 """Super Alexa - Custom Skill que conversa com IA (Gemini Web Anonimo/Autenticado ou Groq),
 com pesquisa na web, alternancia de provedor por voz e memoria persistente no DynamoDB.
 """
+import sys
+
+# Compatibilidade Python 3.8 (PEP 563):
+# Injeta 'from __future__ import annotations' no gemini_webapi no Python < 3.10
+# para permitir type hints com '|' (PEP 604) sem TypeError em tempo de execucao.
+if sys.version_info < (3, 10):
+    try:
+        from importlib.machinery import SourceFileLoader
+
+        _orig_get_code = SourceFileLoader.get_code
+        _orig_source_to_code = SourceFileLoader.source_to_code
+
+        def _patch_gemini_source(data):
+            header = b"from __future__ import annotations\n"
+            if isinstance(data, (bytes, bytearray)):
+                if not data.startswith(header):
+                    return header + bytes(data)
+                return data
+            if isinstance(data, str):
+                if not data.startswith("from __future__ import annotations"):
+                    return "from __future__ import annotations\n" + data
+                return data
+            return data
+
+        def _py38_get_code(self, fullname):
+            if "gemini_webapi" in fullname:
+                try:
+                    filename = self.get_filename(fullname)
+                    data = self.get_data(filename)
+                    data = _patch_gemini_source(data)
+                    return self.source_to_code(data, filename)
+                except Exception:
+                    pass
+            return _orig_get_code(self, fullname)
+
+        def _py38_source_to_code(self, data, path, _optimize=-1):
+            if "gemini_webapi" in str(path):
+                data = _patch_gemini_source(data)
+            return _orig_source_to_code(self, data, path, _optimize=_optimize)
+
+        SourceFileLoader.get_code = _py38_get_code
+        SourceFileLoader.source_to_code = _py38_source_to_code
+    except Exception:
+        pass
+
 import asyncio
 import concurrent.futures
 import html
