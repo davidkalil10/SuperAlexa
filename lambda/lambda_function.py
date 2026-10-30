@@ -523,7 +523,7 @@ def ask_gemini(
                     hist_tag = "histórico salvo" if should_save_history else "chat temporário"
                     _last_engine_used = f"Google Gemini ({model_label}, {thinking_label}, {hist_tag})"
                 else:
-                    _last_engine_used = f"Google Gemini ({model_label})"
+                    _last_engine_used = f"Google Gemini ({model_label}, modo anônimo sem conta)"
                 return text
             except concurrent.futures.TimeoutError:
                 raise AIError("GEMINI_TIMEOUT")
@@ -1276,6 +1276,9 @@ def _converse(handler_input, text):
             should_save = cfg["save_history"] if gem_save_hist is None else bool(gem_save_hist)
             modo_hist = "salvando histórico no seu Gemini" if should_save else "em modo de chat temporário"
 
+            if not _gemini_ready or _gemini_client is None:
+                warmup_gemini(max_wait=3.5)
+
             if _gemini_ready and _gemini_client is not None:
                 cands = _select_gemini_candidates(_gemini_client, cfg["preferred_model"])
                 top_label = cands[0][1] if cands else "padrão"
@@ -1286,12 +1289,12 @@ def _converse(handler_input, text):
                         f"{modo_hist}). Modelos liberados na sua conta: {all_labels}"
                     )
                 else:
-                    motivo = "cookies expiraram ou foram recusados" if psid else "sem cookies configurados"
+                    motivo = "cookies expiraram ou foram recusados pelo Google" if psid else "sem cookies configurados"
                     nome = f"Google Gemini em modo anônimo ({top_label}, {motivo})"
             else:
                 if psid:
                     pref_label = cfg["preferred_model"] or "priorizando 3.8 Flash"
-                    nome = f"Google Gemini com sua conta configurada ({pref_label}, {cfg['thinking_label']}, {modo_hist})"
+                    nome = f"Google Gemini ({pref_label}, inicializando)"
                 else:
                     nome = "Google Gemini em modo anônimo (gratuito, sem cookies no secrets.json)"
         else:
