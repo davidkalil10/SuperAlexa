@@ -47,6 +47,81 @@ if sys.version_info < (3, 10):
     except Exception:
         pass
 
+    # Garante eval_type_backport para Pydantic resolver 'bytes | str' no Python 3.8
+    if "eval_type_backport" not in sys.modules:
+        try:
+            import ast
+            import types
+            import typing
+
+            _GENERIC_MAP = {
+                "list": "List", "dict": "Dict", "tuple": "Tuple",
+                "set": "Set", "frozenset": "FrozenSet", "type": "Type",
+            }
+
+            class _BackportTransformer(ast.NodeTransformer):
+                def visit_BinOp(self, node):
+                    self.generic_visit(node)
+                    if isinstance(node.op, ast.BitOr):
+                        elts = []
+                        def collect(n):
+                            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr):
+                                collect(n.left)
+                                collect(n.right)
+                            else:
+                                elts.append(n)
+                        collect(node)
+                        tup = ast.Tuple(elts=elts, ctx=ast.Load())
+                        slice_node = ast.Index(value=tup) if sys.version_info < (3, 9) else tup
+                        return ast.Subscript(
+                            value=ast.Name(id="_Union", ctx=ast.Load()),
+                            slice=slice_node,
+                            ctx=ast.Load()
+                        )
+                    return node
+
+                def visit_Subscript(self, node):
+                    self.generic_visit(node)
+                    if isinstance(node.value, ast.Name) and node.value.id in _GENERIC_MAP:
+                        node.value = ast.Name(id="_" + _GENERIC_MAP[node.value.id], ctx=node.value.ctx)
+                    return node
+
+            def _inline_eval_type_backport(value, globalns=None, localns=None, *args, **kwargs):
+                if isinstance(value, typing.ForwardRef):
+                    arg = value.__forward_arg__
+                elif isinstance(value, str):
+                    arg = value
+                else:
+                    try:
+                        return typing._eval_type(value, globalns, localns)
+                    except Exception:
+                        return value
+                try:
+                    tree = ast.parse(arg, mode="eval")
+                    new_tree = _BackportTransformer().visit(tree)
+                    ast.fix_missing_locations(new_tree)
+                    code = compile(new_tree, "<type_backport>", "eval")
+                    eval_globals = dict(globalns or {})
+                    eval_globals.setdefault("_Union", typing.Union)
+                    eval_globals.setdefault("Union", typing.Union)
+                    eval_globals.setdefault("Optional", typing.Optional)
+                    eval_globals.setdefault("_List", typing.List)
+                    eval_globals.setdefault("_Dict", typing.Dict)
+                    eval_globals.setdefault("_Tuple", typing.Tuple)
+                    eval_globals.setdefault("_Set", typing.Set)
+                    eval_globals.setdefault("_FrozenSet", typing.FrozenSet)
+                    eval_globals.setdefault("_Type", typing.Type)
+                    return eval(code, eval_globals, localns or {})
+                except Exception:
+                    return typing._eval_type(value, globalns, localns)
+
+            _mod = types.ModuleType("eval_type_backport")
+            _mod.eval_type_backport = _inline_eval_type_backport
+            _mod.install_patch = lambda: None
+            sys.modules["eval_type_backport"] = _mod
+        except Exception:
+            pass
+
 import asyncio
 import concurrent.futures
 import html
