@@ -276,7 +276,7 @@ def detect_provider_switch(text):
 def is_status_command(text):
     """Detecta perguntas sobre qual IA/modelo/provedor esta sendo usado (mesmo sem a palavra 'qual')."""
     norm = _normalize(text)
-    if len(norm.split()) > 9:
+    if len(norm.split()) > 8:
         return False
     if any(norm == p or norm.endswith(p) for p in STATUS_PHRASES):
         return True
@@ -285,7 +285,7 @@ def is_status_command(text):
     )
     has_verb = any(
         w in norm
-        for w in ("usando", "usada", "usado", "ativo", "ativa", "atual", "voce e", "voce usa", "esta", "qual")
+        for w in ("usando", "usada", "usado", "ativo", "ativa", "atual", "voce e", "voce usa")
     )
     return has_target and (has_verb or len(norm.split()) <= 3)
 
