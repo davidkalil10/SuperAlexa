@@ -29,7 +29,7 @@ logger.setLevel(logging.INFO)
 # ----------------------------------------------------------------------------
 # Configuracao
 # ----------------------------------------------------------------------------
-DEFAULT_PROVIDER = os.environ.get("AI_DEFAULT_PROVIDER", "gemini").strip().lower()  # "gemini" ou "groq"
+DEFAULT_PROVIDER = os.environ.get("AI_DEFAULT_PROVIDER", "gemini").strip().lower()  # "gemini" (padrao) ou "groq"
 BASE_URL = os.environ.get("AI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 DEFAULT_MODELS = [
     "openai/gpt-oss-120b",
@@ -182,23 +182,21 @@ async def _init_gemini_async():
     logger.info("Gemini Web inicializado com sucesso (autenticado=%s).", bool(psid))
 
 
-def warmup_gemini_background():
-    """Dispara a inicializacao do Gemini em segundo plano (ex: no LaunchRequest)."""
+def warmup_gemini(max_wait=6.2):
+    """Inicializa o Gemini ANTES do Lambda retornar (a AWS congela threads em background apos o retorno!)."""
     if _gemini_ready:
-        return
-
-    def _runner():
-        with _gemini_lock:
-            if _gemini_ready:
-                return
-            try:
-                loop = _ensure_gemini_loop()
-                fut = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
-                fut.result(timeout=16)
-            except Exception as e:
-                logger.warning("Aquecimento do Gemini falhou: %s", e)
-
-    threading.Thread(target=_runner, daemon=True).start()
+        return True
+    with _gemini_lock:
+        if _gemini_ready:
+            return True
+        try:
+            loop = _ensure_gemini_loop()
+            fut = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
+            fut.result(timeout=max_wait)
+            return True
+        except Exception as e:
+            logger.warning("Aquecimento do Gemini falhou/expirou: %s", e)
+            return False
 
 
 def build_gemini_prompt(history, user_text):
@@ -218,17 +216,12 @@ def build_gemini_prompt(history, user_text):
 
 
 def ask_gemini(history, user_text, timeout=GEMINI_BUDGET_SECONDS):
-    """Chama o Gemini Web (anonimo ou autenticado) dentro do tempo limite."""
+    """Chama o Gemini Web (que ja usa a Busca Google nativa)."""
     t0 = time.monotonic()
     loop = _ensure_gemini_loop()
     if not _gemini_ready:
-        # Se nao estiver aquecido, so tenta inicializar se houver tempo suficiente
-        if timeout < 5.0:
+        if not warmup_gemini(max_wait=max(1.5, timeout - 3.0)):
             raise AIError("GEMINI_NOT_WARMED")
-        with _gemini_lock:
-            if not _gemini_ready:
-                fut_init = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
-                fut_init.result(timeout=max(1.0, timeout - 2.5))
 
     remaining = timeout - (time.monotonic() - t0)
     if remaining < 1.2:
@@ -238,7 +231,6 @@ def ask_gemini(history, user_text, timeout=GEMINI_BUDGET_SECONDS):
     fut = asyncio.run_coroutine_threadsafe(_gemini_client.generate_content(prompt), loop)
     resp = fut.result(timeout=remaining)
     text = (getattr(resp, "text", None) or "").strip()
-    # Remove tags internas de cards do Google (ex: <ElectionCardsGroup>...</ElectionCardsGroup>)
     text = re.sub(r"<[A-Za-z]+[^>]*>.*?</[A-Za-z]+>", "", text, flags=re.S)
     text = re.sub(r"<[A-Za-z]+[^>]*/>", "", text).strip()
     if not text:
@@ -261,15 +253,21 @@ def _normalize(text):
 
 
 def is_reset_command(text):
+    """So limpa a memoria se a frase inteira for um comando curto de reset (evita falsos positivos)."""
     norm = _normalize(text)
-    return any(norm == p or norm.endswith(p) for p in RESET_PHRASES)
+    if len(norm.split()) > 5:
+        return False
+    return any(norm == p or norm.endswith(" " + p) for p in RESET_PHRASES)
 
 
 def detect_provider_switch(text):
+    """So troca de provedor se for um comando curto explicito."""
     norm = _normalize(text)
-    if any(norm == p or norm.endswith(p) for p in SWITCH_TO_GEMINI):
+    if len(norm.split()) > 6:
+        return None
+    if any(norm == p or norm.endswith(" " + p) for p in SWITCH_TO_GEMINI):
         return "gemini"
-    if any(norm == p or norm.endswith(p) for p in SWITCH_TO_GROQ):
+    if any(norm == p or norm.endswith(" " + p) for p in SWITCH_TO_GROQ):
         return "groq"
     return None
 
@@ -311,21 +309,46 @@ STRIP_SEARCH_WORDS = (
 )
 
 
+CONVERSATIONAL_NOISE_RE = re.compile(
+    r"^\s*(?:estou de acordo|de acordo|concordo|discordo|entendi|ok|certo|beleza|legal|pois e|"
+    r"outro tema(?: agora)?|outro assunto(?: agora)?|mudando de assunto|por falar nisso|"
+    r"voce acha que|acha que|o que voce acha|o que acha|sera que|me diga se|quero saber se|"
+    r"vale a pena pagar num|vale a pena pagar em um|vale a pena comprar um|vale a pena|"
+    r"esta equivocado|esta errado|isso esta errado|pesquise melhor|procure melhor|"
+    r"pesquise na internet sobre|pesquise na internet|pesquise sobre|pesquise|busque sobre|busque|"
+    r"procure sobre|procure|quero saber sobre|quero saber|me fale sobre|fale sobre|me explique)\b[\s,!?.:-]*",
+    re.I,
+)
+
+
+def _extract_search_keywords(text):
+    """Limpa muletas de conversa do inicio da frase para gerar uma consulta de busca limpa."""
+    t = (text or "").strip()
+    # Remove acentos temporariamente so para casar regex, ou aplica direto e limpa
+    for _ in range(5):
+        norm = _normalize(t)
+        m = CONVERSATIONAL_NOISE_RE.match(norm)
+        if not m:
+            break
+        words = len(m.group(0).strip().split())
+        t = " ".join(t.split()[words:]).strip(" ,!?.:-")
+    # Se falar de apto/imovel/m2, adiciona 'preco metro quadrado' e remove o preco do proprio usuario
+    # (ex: "350 mil") da busca para nao enviesar os resultados do buscador!
+    norm_t = _normalize(t)
+    if any(w in norm_t for w in ("apto", "apartamento", "imovel", "casa")) and (
+        "m2" in norm_t or "metro" in norm_t or "mil" in norm_t
+    ):
+        t = re.sub(r",?\s*(?:por\s+|de\s+)?(?:r\$\s*)?\d+\s*mil(?:hao|hoes)?\b", "", t, flags=re.I).strip(" ,!?.:-")
+        if "preco" not in norm_t and "valor" not in norm_t:
+            t = f"preco metro quadrado {t}"
+    return t or (text or "").strip()
+
+
 def build_search_query(history, user_text):
     """Monta a consulta de pesquisa combinando o contexto recente quando a fala e curta."""
-    def _clean(t):
-        t = (t or "").strip()
-        low = _normalize(t)
-        for prefix in STRIP_SEARCH_WORDS:
-            if low.startswith(prefix):
-                w = len(prefix.strip().split())
-                t = " ".join(t.split()[w:]).strip() or t
-                break
-        return t
-
-    q = _clean(user_text)
+    q = _extract_search_keywords(user_text)
     if len(q.split()) <= 6 and history:
-        prev_users = [_clean(m.get("content", "")) for m in history if m.get("role") == "user"]
+        prev_users = [_extract_search_keywords(m.get("content", "")) for m in history if m.get("role") == "user"]
         if prev_users:
             recent = " ".join(prev_users[-2:])
             q = f"{recent} {q}".strip()
@@ -468,14 +491,10 @@ def ask_ai(history, user_text, **kwargs):
 
     if provider == "gemini":
         try:
-            # Tenta o Gemini (ja aquecido no LaunchRequest); se demorar mais de ~5.5s ou falhar,
-            # cai automaticamente para o Groq nos ~1.7s restantes para a Alexa nunca dar timeout!
-            gem_timeout = min(GEMINI_BUDGET_SECONDS, max(1.5, deadline - time.monotonic() - 1.5))
+            gem_timeout = min(GEMINI_BUDGET_SECONDS, max(2.0, deadline - time.monotonic() - 1.4))
             return ask_gemini(history, user_text, timeout=gem_timeout)
         except Exception as e:
             logger.warning("Gemini falhou/demorou (%s); fazendo fallback automatico para Groq.", e)
-            # Inicia aquecimento em background caso ainda nao estivesse pronto
-            warmup_gemini_background()
             return ask_groq(history, user_text, deadline=deadline)
     else:
         try:
@@ -581,7 +600,7 @@ def _converse(handler_input, text):
     if new_provider:
         save_user_state(handler_input, provider=new_provider)
         if new_provider == "gemini":
-            warmup_gemini_background()
+            warmup_gemini(max_wait=5.5)
             return _ask(handler_input, "Pronto! Mudei o cerebro principal para o Google Gemini. Pode perguntar!")
         return _ask(handler_input, "Pronto! Mudei o cerebro principal para o Groq. Pode perguntar!")
 
@@ -615,23 +634,10 @@ class LaunchRequestHandler(AbstractRequestHandler):
         return ask_utils.is_request_type("LaunchRequest")(handler_input)
 
     def handle(self, handler_input):
-        # Ja aquece o cliente do Gemini em segundo plano assim que a skill abre!
-        warmup_gemini_background()
+        _, provider = get_user_state(handler_input)
+        if provider == "gemini":
+            warmup_gemini(max_wait=5.8)
         return _ask(handler_input, MSG_WELCOME)
-
-
-class SwitchProviderIntentHandler(AbstractRequestHandler):
-    def can_handle(self, handler_input):
-        return ask_utils.is_intent_name("SwitchProviderIntent")(handler_input)
-
-    def handle(self, handler_input):
-        prov = _normalize(ask_utils.get_slot_value(handler_input, "provider") or "")
-        target = "gemini" if "gemini" in prov else "groq"
-        save_user_state(handler_input, provider=target)
-        if target == "gemini":
-            warmup_gemini_background()
-            return _ask(handler_input, "Pronto! Mudei o cerebro principal para o Google Gemini. Pode perguntar!")
-        return _ask(handler_input, "Pronto! Mudei o cerebro principal para o Groq. Pode perguntar!")
 
 
 class ChatIntentHandler(AbstractRequestHandler):
@@ -729,10 +735,9 @@ def _build_persistence_adapter():
 sb = CustomSkillBuilder(persistence_adapter=_build_persistence_adapter())
 
 sb.add_request_handler(LaunchRequestHandler())
-sb.add_request_handler(ResetHistoryIntentHandler())
-sb.add_request_handler(SwitchProviderIntentHandler())
 sb.add_request_handler(ChatIntentHandler())
 sb.add_request_handler(CatchAllIntentHandler())
+sb.add_request_handler(ResetHistoryIntentHandler())
 sb.add_request_handler(HelpIntentHandler())
 sb.add_request_handler(CancelOrStopIntentHandler())
 sb.add_request_handler(FallbackIntentHandler())

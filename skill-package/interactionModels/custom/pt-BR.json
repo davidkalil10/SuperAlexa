@@ -16,47 +16,6 @@
           "samples": []
         },
         {
-          "name": "ResetHistoryIntent",
-          "slots": [],
-          "samples": [
-            "nova conversa",
-            "iniciar nova conversa",
-            "comecar uma nova conversa",
-            "começar de novo",
-            "esquecer tudo",
-            "esqueça tudo",
-            "zerar memória",
-            "zerar histórico",
-            "limpar memória",
-            "limpar histórico",
-            "apagar memória",
-            "apagar histórico",
-            "apague a memória",
-            "apague o histórico"
-          ]
-        },
-        {
-          "name": "SwitchProviderIntent",
-          "slots": [
-            {
-              "name": "provider",
-              "type": "AI_PROVIDER"
-            }
-          ],
-          "samples": [
-            "usar {provider}",
-            "usar o {provider}",
-            "mudar para {provider}",
-            "mudar para o {provider}",
-            "trocar para {provider}",
-            "trocar para o {provider}",
-            "ativar {provider}",
-            "ativar o {provider}",
-            "modo {provider}",
-            "ligar {provider}"
-          ]
-        },
-        {
           "name": "ChatIntent",
           "slots": [
             {
@@ -94,6 +53,33 @@
             "exatamente {query}",
             "isso mesmo {query}",
             "isso {query}",
+            "estou de acordo {query}",
+            "de acordo {query}",
+            "concordo {query}",
+            "discordo {query}",
+            "faz sentido {query}",
+            "entendo {query}",
+            "verdade {query}",
+            "pois é {query}",
+            "outro tema {query}",
+            "outro assunto {query}",
+            "mudando de assunto {query}",
+            "falando em {query}",
+            "por falar em {query}",
+            "aliás {query}",
+            "acha {query}",
+            "acha que {query}",
+            "você acha {query}",
+            "você acha que {query}",
+            "o que acha {query}",
+            "o que você acha {query}",
+            "vale a pena {query}",
+            "está equivocado {query}",
+            "está errado {query}",
+            "isso está errado {query}",
+            "tem certeza {query}",
+            "confira {query}",
+            "verifique {query}",
             "eu {query}",
             "eu quero {query}",
             "eu queria {query}",
@@ -552,30 +538,6 @@
             {
               "name": {
                 "value": "explique melhor essa última parte por favor"
-              }
-            }
-          ]
-        },
-        {
-          "name": "AI_PROVIDER",
-          "values": [
-            {
-              "name": {
-                "value": "gemini",
-                "synonyms": [
-                  "google gemini",
-                  "google"
-                ]
-              }
-            },
-            {
-              "name": {
-                "value": "groq",
-                "synonyms": [
-                  "grok",
-                  "brock",
-                  "glock"
-                ]
               }
             }
           ]
