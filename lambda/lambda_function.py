@@ -18,6 +18,10 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape
 
+# Garante que boto3 encontre uma regiao padrao mesmo se o runtime nao tiver injetado
+if "AWS_DEFAULT_REGION" not in os.environ and "AWS_REGION" not in os.environ:
+    os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+
 import ask_sdk_core.utils as ask_utils
 from ask_sdk_core.dispatch_components import (
     AbstractExceptionHandler,
@@ -1039,25 +1043,44 @@ def is_continue_command(text):
 
 
 # ----------------------------------------------------------------------------
-# Memoria e Preferencias no DynamoDB
+# Memoria e Preferencias no DynamoDB (com fallback em SessionAttributes)
 # ----------------------------------------------------------------------------
 def get_user_state(handler_input):
+    history = []
+    provider = DEFAULT_PROVIDER
+    try:
+        sess = handler_input.attributes_manager.session_attributes or {}
+        if "provider" in sess:
+            provider = sess["provider"]
+    except Exception:
+        sess = {}
+
     try:
         attrs = handler_input.attributes_manager.persistent_attributes
         history = list(attrs.get("history", []))
-        provider = attrs.get("provider") or DEFAULT_PROVIDER
+        provider = attrs.get("provider") or provider
         return history, provider
     except Exception as e:
-        logger.warning("Falha ao ler DynamoDB (usando estado padrao): %s", e)
-        return [], DEFAULT_PROVIDER
+        logger.warning("Falha ao ler DynamoDB (usando sessao/padrao): %s", e)
+        return history, provider
 
 
 def get_gemini_prefs(handler_input):
+    save_hist = None
+    meta = None
+    try:
+        sess = handler_input.attributes_manager.session_attributes or {}
+        save_hist = sess.get("gemini_save_history")
+    except Exception:
+        pass
     try:
         attrs = handler_input.attributes_manager.persistent_attributes
-        return attrs.get("gemini_save_history"), attrs.get("gemini_chat_metadata")
+        if save_hist is None:
+            save_hist = attrs.get("gemini_save_history")
+        meta = attrs.get("gemini_chat_metadata")
     except Exception:
-        return None, None
+        pass
+    return save_hist, meta
 
 
 def _size(messages):
@@ -1100,6 +1123,16 @@ def save_user_state(
     gemini_save_history=None,
     gemini_chat_metadata=...,
 ):
+    try:
+        sess = handler_input.attributes_manager.session_attributes or {}
+        if provider is not None:
+            sess["provider"] = provider
+        if gemini_save_history is not None:
+            sess["gemini_save_history"] = bool(gemini_save_history)
+        handler_input.attributes_manager.session_attributes = sess
+    except Exception:
+        pass
+
     try:
         mgr = handler_input.attributes_manager
         attrs = mgr.persistent_attributes
@@ -1145,29 +1178,16 @@ def _get_user_id(handler_input):
         return "default"
 
 
-def _remaining_lambda_seconds(req_start):
-    """Calcula o tempo restante real do container AWS Lambda descontando 1.5s de margem de seguranca."""
-    elapsed = time.monotonic() - req_start
-    soft_rem = MAX_LAMBDA_SAFE_SECONDS - elapsed
-    if _lambda_context is not None and hasattr(_lambda_context, "get_remaining_time_in_millis"):
-        try:
-            hw_rem = (_lambda_context.get_remaining_time_in_millis() / 1000.0) - 1.5
-            return min(soft_rem, hw_rem)
-        except Exception:
-            pass
-    return soft_rem
-
-
 def _wait_with_progressive(handler_input, future, req_start):
-    """Aguarda a tarefa respeitando o tempo restante real do AWS Lambda."""
-    rem1 = _remaining_lambda_seconds(req_start)
-    wait1 = max(0.2, min(PROGRESSIVE_WAIT_SECONDS, rem1 - 0.4))
+    """Aguarda a tarefa respeitando o tempo seguro do Lambda (MAX_LAMBDA_SAFE_SECONDS)."""
+    elapsed = time.monotonic() - req_start
+    wait1 = max(0.2, min(PROGRESSIVE_WAIT_SECONDS, MAX_LAMBDA_SAFE_SECONDS - elapsed - 0.5))
     try:
         return future.result(timeout=wait1), True
     except concurrent.futures.TimeoutError:
-        if _remaining_lambda_seconds(req_start) > 1.0:
-            send_progressive_speech(handler_input, MSG_PROGRESSIVE)
-        wait2 = max(0.15, _remaining_lambda_seconds(req_start))
+        send_progressive_speech(handler_input, MSG_PROGRESSIVE)
+        elapsed = time.monotonic() - req_start
+        wait2 = max(0.2, MAX_LAMBDA_SAFE_SECONDS - elapsed)
         try:
             return future.result(timeout=wait2), True
         except concurrent.futures.TimeoutError:
@@ -1419,39 +1439,32 @@ class CatchAllExceptionHandler(AbstractExceptionHandler):
 # ----------------------------------------------------------------------------
 # Skill
 # ----------------------------------------------------------------------------
-class _LazyDynamoDbAdapter(DynamoDbAdapter):
-    """Inicializa o recurso boto3/DynamoDB sob demanda para nao atrasar o LaunchRequest em cold start."""
-
-    def __init__(self, table_name, region_name):
-        self.table_name = table_name
-        self._region_name = region_name
-        self._real_adapter = None
-
-    def _get_adapter(self):
-        if self._real_adapter is None:
-            import boto3
-
-            self._real_adapter = DynamoDbAdapter(
-                table_name=self.table_name,
-                create_table=False,
-                dynamodb_resource=boto3.resource("dynamodb", region_name=self._region_name),
-            )
-        return self._real_adapter
-
-    def get_attributes(self, request_envelope):
-        return self._get_adapter().get_attributes(request_envelope)
-
-    def save_attributes(self, request_envelope, attributes):
-        return self._get_adapter().save_attributes(request_envelope, attributes)
-
-
 def _build_persistence_adapter():
-    table = os.environ.get("DYNAMODB_PERSISTENCE_TABLE_NAME") or "super_alexa_memory"
-    region = os.environ.get("DYNAMODB_PERSISTENCE_REGION") or os.environ.get("AWS_REGION")
-    return _LazyDynamoDbAdapter(table_name=table, region_name=region)
+    table = os.environ.get("DYNAMODB_PERSISTENCE_TABLE_NAME")
+    if not table:
+        logger.warning("DYNAMODB_PERSISTENCE_TABLE_NAME nao definido. Persistencia DynamoDB desativada.")
+        return None
+    try:
+        import boto3
+
+        region = (
+            os.environ.get("DYNAMODB_PERSISTENCE_REGION")
+            or os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+            or "us-east-1"
+        )
+        return DynamoDbAdapter(
+            table_name=table,
+            create_table=False,
+            dynamodb_resource=boto3.resource("dynamodb", region_name=region),
+        )
+    except Exception as exc:
+        logger.warning("Falha ao inicializar DynamoDbAdapter (%s). Continuando sem persistencia.", exc)
+        return None
 
 
-sb = CustomSkillBuilder(persistence_adapter=_build_persistence_adapter())
+_adapter = _build_persistence_adapter()
+sb = CustomSkillBuilder(persistence_adapter=_adapter) if _adapter else CustomSkillBuilder()
 
 sb.add_request_handler(LaunchRequestHandler())
 sb.add_request_handler(ChatIntentHandler())
@@ -1463,22 +1476,4 @@ sb.add_request_handler(FallbackIntentHandler())
 sb.add_request_handler(SessionEndedRequestHandler())
 sb.add_exception_handler(CatchAllExceptionHandler())
 
-_raw_lambda_handler = sb.lambda_handler()
-
-
-def lambda_handler(event, context):
-    global _lambda_context
-    _lambda_context = context
-    try:
-        return _raw_lambda_handler(event, context)
-    except BaseException as exc:
-        logger.exception("Erro fatal no lambda_handler: %s", exc)
-        err_msg = clean_for_speech(f"Desculpe, ocorreu um erro ao processar o pedido: {type(exc).__name__}")
-        return {
-            "version": "1.0",
-            "response": {
-                "outputSpeech": {"type": "SSML", "ssml": f"<speak>{err_msg}</speak>"},
-                "reprompt": {"outputSpeech": {"type": "SSML", "ssml": f"<speak>{MSG_REPROMPT}</speak>"}},
-                "shouldEndSession": False,
-            },
-        }
+lambda_handler = sb.lambda_handler()
