@@ -484,6 +484,7 @@ def _start_cooldown(model, http_error):
 
 def ask_groq(history, user_text, deadline=None):
     """Enriquece a pergunta com pesquisa DuckDuckGo e chama a cascata do Groq."""
+    global _last_engine_used
     api_key = _load_api_key()
     if not api_key:
         raise AIError("NO_KEY")
@@ -518,7 +519,6 @@ def ask_groq(history, user_text, deadline=None):
             break
         try:
             ans = _post_chat(model, messages, api_key, timeout=min(remaining, 5.5))
-            global _last_engine_used
             _last_engine_used = f"Groq ({model.split('/')[-1]})"
             return ans
         except urllib.error.HTTPError as e:
@@ -782,11 +782,11 @@ def _converse(handler_input, text):
             return _ask(handler_input, MSG_HOLD)
     except AIError as e:
         logger.error("Falha na IA: %s", e)
-        msg = MSG_NO_KEY if str(e) == "NO_KEY" else (MSG_TIMEOUT if str(e) == "TIMEOUT" else MSG_ERROR)
+        msg = MSG_NO_KEY if str(e) == "NO_KEY" else (MSG_TIMEOUT if str(e) == "TIMEOUT" else f"Desculpe, ocorreu o erro: {clean_for_speech(str(e)[:120])}")
         return _ask(handler_input, msg)
     except Exception as e:
         logger.error("Falha inesperada na IA: %s", e)
-        return _ask(handler_input, MSG_ERROR)
+        return _ask(handler_input, f"Desculpe, ocorreu o erro técnico: {clean_for_speech(type(e).__name__ + ' ' + str(e)[:120])}")
 
     history += [
         {"role": "user", "content": text},
@@ -877,7 +877,10 @@ class CatchAllExceptionHandler(AbstractExceptionHandler):
 
     def handle(self, handler_input, exception):
         logger.exception("Erro nao tratado: %s", exception)
-        return _ask(handler_input, MSG_ERROR)
+        return _ask(
+            handler_input,
+            f"Desculpe, erro interno no handler: {clean_for_speech(type(exception).__name__ + ' ' + str(exception)[:120])}",
+        )
 
 
 # ----------------------------------------------------------------------------
