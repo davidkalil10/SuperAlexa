@@ -135,7 +135,10 @@ STATUS_PHRASES = (
 )
 
 MSG_WELCOME = "Modo super ativado! Pode falar, sobre o que vamos conversar?"
-STOP_WORDS = {"parar", "para", "pare", "sair", "tchau", "cancelar", "cancela", "encerrar", "ate logo", "chega", "fechar"}
+STOP_WORDS = {
+    "parar", "para", "pare", "sair", "tchau", "cancelar", "cancela",
+    "encerrar", "encerra", "terminar", "termina", "ate logo", "chega", "fechar", "basta",
+}
 HELP_WORDS = {"ajuda", "me ajuda", "socorro"}
 MSG_REPROMPT = "Pode continuar, estou ouvindo."
 MSG_HELP = (
@@ -183,6 +186,7 @@ def _load_gemini_cookies():
 _gemini_loop = None
 _gemini_client = None
 _gemini_ready = False
+_gemini_init_task = None
 _gemini_lock = threading.Lock()
 
 
@@ -196,51 +200,51 @@ def _ensure_gemini_loop():
 
 
 async def _init_gemini_async():
-    global _gemini_client, _gemini_ready
-    from gemini_webapi import GeminiClient
+    global _gemini_client, _gemini_ready, _gemini_init_task
+    if _gemini_ready:
+        return
+    if _gemini_init_task is not None and not _gemini_init_task.done():
+        await _gemini_init_task
+        return
 
-    psid, psidts = _load_gemini_cookies()
-    client = GeminiClient(psid, psidts) if psid else GeminiClient()
-    await client.init(timeout=15, auto_close=False, auto_refresh=bool(psid))
-    _gemini_client = client
-    _gemini_ready = True
-    logger.info("Gemini Web inicializado com sucesso (autenticado=%s).", bool(psid))
+    async def _do_init():
+        global _gemini_client, _gemini_ready
+        from gemini_webapi import GeminiClient
+
+        psid, psidts = _load_gemini_cookies()
+        client = GeminiClient(psid, psidts) if psid else GeminiClient()
+        await client.init(timeout=15, auto_close=False, auto_refresh=bool(psid))
+        _gemini_client = client
+        _gemini_ready = True
+        logger.info("Gemini Web inicializado com sucesso (autenticado=%s).", bool(psid))
+
+    _gemini_init_task = asyncio.create_task(_do_init())
+    await _gemini_init_task
 
 
 def warmup_gemini_background():
     """Dispara a inicializacao do Gemini em background sem travar a resposta da Alexa."""
     if _gemini_ready:
         return
-
-    def _runner():
-        with _gemini_lock:
-            if _gemini_ready:
-                return
-            try:
-                loop = _ensure_gemini_loop()
-                fut = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
-                fut.result(timeout=15)
-            except Exception as e:
-                logger.warning("Aquecimento do Gemini em background falhou: %s", e)
-
-    threading.Thread(target=_runner, daemon=True).start()
+    try:
+        loop = _ensure_gemini_loop()
+        asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
+    except Exception as e:
+        logger.warning("Aquecimento do Gemini em background falhou: %s", e)
 
 
 def warmup_gemini(max_wait=5.0):
-    """Aguarda a inicializacao do Gemini ate max_wait segundos."""
+    """Aguarda a inicializacao do Gemini ate max_wait segundos (sem travar threads futuras se expirar)."""
     if _gemini_ready:
         return True
-    with _gemini_lock:
-        if _gemini_ready:
-            return True
-        try:
-            loop = _ensure_gemini_loop()
-            fut = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
-            fut.result(timeout=max_wait)
-            return True
-        except Exception as e:
-            logger.warning("Aquecimento do Gemini falhou/expirou: %s", e)
-            return False
+    try:
+        loop = _ensure_gemini_loop()
+        fut = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
+        fut.result(timeout=max_wait)
+        return True
+    except Exception as e:
+        logger.warning("Aquecimento do Gemini falhou/expirou: %s", e)
+        return False
 
 
 def build_gemini_prompt(history, user_text):
