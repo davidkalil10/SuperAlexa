@@ -223,16 +223,26 @@ def _load_gemini_cookies():
     psid = (
         os.environ.get("GEMINI_1PSID")
         or os.environ.get("__Secure-1PSID")
+        or os.environ.get("GEMINI_3PSID")
+        or os.environ.get("__Secure-3PSID")
         or data.get("GEMINI_1PSID")
         or data.get("Secure_1PSID")
         or data.get("__Secure-1PSID")
+        or data.get("GEMINI_3PSID")
+        or data.get("Secure_3PSID")
+        or data.get("__Secure-3PSID")
     )
     psidts = (
         os.environ.get("GEMINI_1PSIDTS")
         or os.environ.get("__Secure-1PSIDTS")
+        or os.environ.get("GEMINI_3PSIDTS")
+        or os.environ.get("__Secure-3PSIDTS")
         or data.get("GEMINI_1PSIDTS")
         or data.get("Secure_1PSIDTS")
         or data.get("__Secure-1PSIDTS")
+        or data.get("GEMINI_3PSIDTS")
+        or data.get("Secure_3PSIDTS")
+        or data.get("__Secure-3PSIDTS")
     )
     return _clean_cookie_val(psid), _clean_cookie_val(psidts)
 
@@ -317,7 +327,7 @@ async def _init_gemini_async():
         if psid:
             try:
                 cand = _FastGeminiClient(psid, psidts)
-                await cand.init(timeout=15, auto_close=False, auto_refresh=True)
+                await cand.init(timeout=10, auto_close=False, auto_refresh=False)
                 if getattr(cand, "account_status", None) == AccountStatus.AVAILABLE:
                     client = cand
                     is_auth = True
@@ -325,16 +335,17 @@ async def _init_gemini_async():
                     logger.info("Gemini Web autenticado na conta com sucesso! Modelos disponiveis: %s", models_info)
                 else:
                     logger.warning(
-                        "Cookies do Gemini nao autenticaram (status=%s); usando modo anonimo como fallback.",
+                        "Cookies do Gemini nao autenticaram (status=%s); usando sessao como anonima.",
                         getattr(cand, "account_status", None),
                     )
-                    await cand.close()
+                    client = cand
+                    is_auth = False
             except Exception as e:
-                logger.warning("Falha ao inicializar Gemini com cookies (%s); usando modo anonimo.", e)
+                logger.warning("Falha ao inicializar Gemini com cookies (%s); criando sessao anonima.", e)
 
         if client is None:
             client = _FastGeminiClient()
-            await client.init(timeout=15, auto_close=False, auto_refresh=False)
+            await client.init(timeout=10, auto_close=False, auto_refresh=False)
             is_auth = False
             logger.info("Gemini Web inicializado em modo anonimo (sem cookies).")
 
@@ -455,7 +466,7 @@ def ask_gemini(
     t0 = time.monotonic()
     loop = _ensure_gemini_loop()
     if not _gemini_ready or _gemini_client is None:
-        if not warmup_gemini(max_wait=min(4.2, max(2.0, timeout - 2.2))):
+        if not warmup_gemini(max_wait=min(6.5, max(2.5, timeout - 2.0))):
             raise AIError("GEMINI_NOT_WARMED")
 
     cfg = _load_gemini_config()
@@ -1277,7 +1288,7 @@ def _converse(handler_input, text):
             modo_hist = "salvando histórico no seu Gemini" if should_save else "em modo de chat temporário"
 
             if not _gemini_ready or _gemini_client is None:
-                warmup_gemini(max_wait=3.5)
+                warmup_gemini(max_wait=5.5)
 
             if _gemini_ready and _gemini_client is not None:
                 cands = _select_gemini_candidates(_gemini_client, cfg["preferred_model"])
