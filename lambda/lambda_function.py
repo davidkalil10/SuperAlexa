@@ -15,6 +15,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from xml.sax.saxutils import escape
 
 import ask_sdk_core.utils as ask_utils
@@ -31,12 +32,13 @@ logger.setLevel(logging.INFO)
 # ----------------------------------------------------------------------------
 # Configuracao
 # ----------------------------------------------------------------------------
-DEFAULT_PROVIDER = os.environ.get("AI_DEFAULT_PROVIDER", "gemini").strip().lower()  # "gemini" (padrao) ou "groq"
+DEFAULT_PROVIDER = os.environ.get("AI_DEFAULT_PROVIDER", "groq").strip().lower()  # "groq" (rapido) ou "gemini"
 BASE_URL = os.environ.get("AI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 DEFAULT_MODELS = [
-    "openai/gpt-oss-120b",
     "qwen/qwen3.8-27b",
+    "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
+    "openai/gpt-oss-safeguard-20b",
     "allam-2-7b",
 ]
 MODELS = [m.strip() for m in os.environ.get("AI_MODELS", "").split(",") if m.strip()] or DEFAULT_MODELS
@@ -45,24 +47,25 @@ MODELS = [m.strip() for m in os.environ.get("AI_MODELS", "").split(",") if m.str
 # so ao estourar o teto descartamos as mensagens mais antigas.
 MAX_STORED_BYTES = int(os.environ.get("MAX_STORED_BYTES", str(300 * 1024)))
 # Para a IA enviamos apenas as mensagens mais recentes que cabem neste orcamento de caracteres
-# (3500 chars ~ 900 tokens: evita estourar o limite de 6000-8000 TPM do plano gratuito da Groq!).
-CONTEXT_CHAR_BUDGET = int(os.environ.get("CONTEXT_CHAR_BUDGET", "3500"))
-MAX_CONTEXT_TURNS = int(os.environ.get("MAX_CONTEXT_TURNS", "8"))  # ultimas 8 mensagens (4 trocas completas)
-MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "500"))
+# (2400 chars ~ 600 tokens: evita estourar o limite de TPD/TPM do plano gratuito da Groq!).
+CONTEXT_CHAR_BUDGET = int(os.environ.get("CONTEXT_CHAR_BUDGET", "2400"))
+MAX_CONTEXT_TURNS = int(os.environ.get("MAX_CONTEXT_TURNS", "6"))  # ultimas 6 mensagens (3 trocas completas)
+MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "240"))
 # A Alexa derruba a resposta apos ~8s; deixamos margem.
 TOTAL_BUDGET_SECONDS = float(os.environ.get("AI_TOTAL_BUDGET", "7.2"))
 GEMINI_BUDGET_SECONDS = float(os.environ.get("GEMINI_BUDGET", "5.8"))
 MAX_SPEECH_CHARS = 1500
 
-# Busca web automatica por baixo dos panos para o Groq (DuckDuckGo Lite, ~0.4s).
+# Busca web automatica por baixo dos panos (DuckDuckGo Lite, ~0.4s).
 WEB_SEARCH_ENABLED = os.environ.get("AI_SEARCH_ENABLED", "1") != "0"
-WEB_SEARCH_TIMEOUT = float(os.environ.get("AI_WEB_SEARCH_TIMEOUT", "2.2"))
-WEB_SEARCH_MAX_RESULTS = int(os.environ.get("AI_WEB_SEARCH_RESULTS", "5"))
+WEB_SEARCH_TIMEOUT = float(os.environ.get("AI_WEB_SEARCH_TIMEOUT", "2.0"))
+WEB_SEARCH_MAX_RESULTS = int(os.environ.get("AI_WEB_SEARCH_RESULTS", "6"))
 
 # Cooldown de modelos com 429 (persiste enquanto o Lambda estiver "quente").
 _cooldown_until = {}
 DEFAULT_COOLDOWN = 60.0
-_last_engine_used = None  # registra exatamente quem gerou a ultima resposta (ex: "Google Gemini" ou "Groq (gpt-oss-120b)")
+_last_engine_used = None  # registra exatamente quem gerou a ultima resposta (ex: "Google Gemini" ou "Groq (qwen3.8-27b)")
+_last_topic_by_user = {}  # guarda o ultimo assunto pesquisado mesmo se um turno anterior der erro
 
 # Tarefas de pesquisa longa em andamento por usuario: {user_id: {"future": fut, "question": str, "provider": str, "started": float}}
 _pending_tasks = {}
@@ -77,25 +80,31 @@ CONTINUE_PHRASES = (
 MSG_PROGRESSIVE = "Só um instante, estou pesquisando..."
 MSG_HOLD = "A pesquisa está bem completa, diga: continuar, para eu ler a resposta!"
 
-SYSTEM_PROMPT = (
-    "Você é a Super Alexa, uma assistente de voz inteligente, simpática e direta. "
-    "Responda SEMPRE em português do Brasil com acentuação ortográfica correta e completa "
-    "(use sempre á, é, í, ó, ú, ã, õ, ç, ê, ô corretamente para que a síntese de voz pronuncie bem), "
-    "de forma curta e natural para ser falada em voz alta (no máximo 2 ou 3 frases curtas, a menos que o usuário peça mais detalhes). "
-    "NÃO use markdown, listas com marcadores, asteriscos, emojis, tabelas ou links. "
-    "Se precisar enumerar, use frases corridas. Use o histórico da conversa para manter o contexto. "
-    "IMPORTANTE SOBRE FRASES CORTADAS E CONTINUAÇÕES: A Alexa às vezes remove a primeira palavra da frase "
-    "do usuário (como 'é um', 'pesquise', 'quero saber', 'sobre', 'como') ou o usuário responde com uma "
-    "palavra solta ou complemento curto (ex: 'Ronin', 'um jogo j2me', 'e ele?'). Se a fala atual tiver relação "
-    "com o assunto anterior, reconstrua o sentido combinando com o histórico; mas se for uma pergunta sobre "
-    "uma nova pessoa ou novo assunto sem relação com o anterior, trate como um assunto novo do zero e NÃO "
-    "misture com o tema antigo! "
-    "IMPORTANTE SOBRE PESQUISA NA WEB: Use os dados de pesquisa na web fornecidos (ou sua busca Google nativa) "
-    "para responder sobre fatos recentes, eleições, notícias, pessoas, empresas ou jogos específicos com precisão. "
-    "NUNCA invente fatos. Se não encontrar informação confiável, diga isso com honestidade e peça mais detalhes. "
-    "Você NÃO controla dispositivos, músicas, alarmes ou casa inteligente; se pedirem isso, "
-    "explique gentilmente que nesta skill você só conversa."
-)
+
+def _current_br_date():
+    now_br = datetime.now(timezone(timedelta(hours=-3)))
+    return now_br.strftime("%d/%m/%Y"), now_br.year
+
+
+def get_system_prompt():
+    hoje_str, ano_atual = _current_br_date()
+    return (
+        f"Você é a Super Alexa, uma assistente de voz inteligente, simpática e direta. "
+        f"DATA ATUAL: Hoje é {hoje_str} (ano de {ano_atual}). Seu treinamento original parou no passado, "
+        f"portanto NUNCA diga que eventos ou eleições de {ano_atual} ainda não ocorreram ou que as últimas foram em 2022. "
+        f"Responda SEMPRE em português do Brasil com acentuação ortográfica correta e completa "
+        f"(use á, é, í, ó, ú, ã, õ, ç, ê, ô corretamente para a síntese de voz), "
+        f"de forma curta e natural para ser falada em voz alta (no máximo 2 ou 3 frases curtas, a menos que o usuário peça mais detalhes). "
+        f"NÃO use markdown, listas, asteriscos, emojis, tabelas ou links, e NÃO tente chamar ferramentas/tools externas. "
+        f"Reconstrua frases que tiveram a primeira palavra cortada pela Alexa usando o histórico da conversa, "
+        f"mas trate um assunto novo do zero sem misturar com o tema anterior. "
+        f"PRIORIDADE DE FATOS: Baseie-se SEMPRE nos [Resultados de pesquisa na web] fornecidos na mensagem "
+        f"para responder sobre fatos recentes, eleições (incluindo 1º e 2º turno), notícias, preços de imóveis, pessoas ou jogos. "
+        f"NUNCA invente nomes, candidatos ou números que não estejam nos resultados da pesquisa."
+    )
+
+
+SYSTEM_PROMPT = get_system_prompt()
 
 RESET_PHRASES = (
     "nova conversa",
@@ -181,12 +190,13 @@ def _load_gemini_cookies():
 
 
 # ----------------------------------------------------------------------------
-# Cliente Gemini Web (HanaokaYuzu/Gemini-API) com aquecimento em background
+# Cliente Gemini Web (HanaokaYuzu/Gemini-API)
 # ----------------------------------------------------------------------------
 _gemini_loop = None
 _gemini_client = None
 _gemini_ready = False
 _gemini_init_task = None
+_gemini_init_started = 0.0
 _gemini_lock = threading.Lock()
 
 
@@ -200,12 +210,18 @@ def _ensure_gemini_loop():
 
 
 async def _init_gemini_async():
-    global _gemini_client, _gemini_ready, _gemini_init_task
-    if _gemini_ready:
+    global _gemini_client, _gemini_ready, _gemini_init_task, _gemini_init_started
+    if _gemini_ready and _gemini_client is not None:
         return
     if _gemini_init_task is not None and not _gemini_init_task.done():
-        await _gemini_init_task
-        return
+        if (time.monotonic() - _gemini_init_started) <= 16.0:
+            await _gemini_init_task
+            return
+        try:
+            _gemini_init_task.cancel()
+        except Exception:
+            pass
+        _gemini_init_task = None
 
     async def _do_init():
         global _gemini_client, _gemini_ready
@@ -218,13 +234,19 @@ async def _init_gemini_async():
         _gemini_ready = True
         logger.info("Gemini Web inicializado com sucesso (autenticado=%s).", bool(psid))
 
+    _gemini_init_started = time.monotonic()
     _gemini_init_task = asyncio.create_task(_do_init())
-    await _gemini_init_task
+    try:
+        await _gemini_init_task
+    except Exception:
+        _gemini_ready = False
+        _gemini_init_task = None
+        raise
 
 
 def warmup_gemini_background():
-    """Dispara a inicializacao do Gemini em background sem travar a resposta da Alexa."""
-    if _gemini_ready:
+    """Dispara a inicializacao do Gemini em paralelo durante uma requisicao ativa."""
+    if _gemini_ready and _gemini_client is not None:
         return
     try:
         loop = _ensure_gemini_loop()
@@ -234,50 +256,68 @@ def warmup_gemini_background():
 
 
 def warmup_gemini(max_wait=5.0):
-    """Aguarda a inicializacao do Gemini ate max_wait segundos (sem travar threads futuras se expirar)."""
-    if _gemini_ready:
+    """Aguarda a inicializacao do Gemini ate max_wait segundos sem cancelar se ainda estiver dentro do prazo normal (~8s)."""
+    global _gemini_ready, _gemini_init_task
+    if _gemini_ready and _gemini_client is not None:
         return True
     try:
         loop = _ensure_gemini_loop()
         fut = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
         fut.result(timeout=max_wait)
         return True
+    except concurrent.futures.TimeoutError:
+        logger.warning("Aquecimento do Gemini ainda em andamento apos %.1fs (continua em background).", max_wait)
+        return False
     except Exception as e:
-        logger.warning("Aquecimento do Gemini falhou/expirou: %s", e)
+        logger.warning("Aquecimento do Gemini falhou: %s", e)
+        _gemini_ready = False
+        _gemini_init_task = None
         return False
 
 
-def build_gemini_prompt(history, user_text):
+def build_gemini_prompt(history, user_text, search_query="", web_snippets=""):
     ctx = ""
     if history:
         lines = []
-        for m in history[-8:]:
+        for m in history[-6:]:
             role = "Usuário" if m.get("role") == "user" else "Assistente"
             lines.append(f"{role}: {m.get('content', '')}")
         ctx = "Histórico recente da conversa:\n" + "\n".join(lines) + "\n\n"
+    search_block = ""
+    if web_snippets:
+        search_block = f"[Resultados de pesquisa na web para \"{search_query}\":\n{web_snippets}]\n\n"
     return (
-        f"{SYSTEM_PROMPT}\n\n"
+        f"{get_system_prompt()}\n\n"
         f"{ctx}"
+        f"{search_block}"
         f"Nova fala do usuário (pode ter tido a primeira palavra cortada pela Alexa): {user_text}\n\n"
         "Responda agora em português do Brasil (com acentuação correta) em no máximo 2 ou 3 frases curtas para voz, sem markdown:"
     )
 
 
-def ask_gemini(history, user_text, timeout=12.0):
-    """Chama o Gemini Web (que ja usa a Busca Google nativa)."""
+def ask_gemini(history, user_text, timeout=11.0, search_query="", web_snippets=""):
+    """Chama o Gemini Web com enriquecimento de pesquisa e recuperacao automatica de sessao."""
+    global _gemini_ready, _gemini_init_task
     t0 = time.monotonic()
     loop = _ensure_gemini_loop()
-    if not _gemini_ready:
-        if not warmup_gemini(max_wait=max(2.0, timeout - 3.5)):
+    if not _gemini_ready or _gemini_client is None:
+        if not warmup_gemini(max_wait=min(4.2, max(2.0, timeout - 2.2))):
             raise AIError("GEMINI_NOT_WARMED")
 
     remaining = timeout - (time.monotonic() - t0)
     if remaining < 1.2:
         raise AIError("TIMEOUT")
 
-    prompt = build_gemini_prompt(history, user_text)
-    fut = asyncio.run_coroutine_threadsafe(_gemini_client.generate_content(prompt), loop)
-    resp = fut.result(timeout=remaining)
+    prompt = build_gemini_prompt(history, user_text, search_query=search_query, web_snippets=web_snippets)
+    try:
+        fut = asyncio.run_coroutine_threadsafe(_gemini_client.generate_content(prompt), loop)
+        resp = fut.result(timeout=remaining)
+    except concurrent.futures.TimeoutError:
+        raise AIError("GEMINI_TIMEOUT")
+    except Exception as e:
+        _gemini_ready = False
+        _gemini_init_task = None
+        raise AIError(f"GEMINI_ERR: {type(e).__name__}")
     text = (getattr(resp, "text", None) or "").strip()
     text = re.sub(r"<[A-Za-z]+[^>]*>.*?</[A-Za-z]+>", "", text, flags=re.S)
     text = re.sub(r"<[A-Za-z]+[^>]*/>", "", text).strip()
@@ -360,92 +400,166 @@ def clean_for_speech(text):
 
 
 # ----------------------------------------------------------------------------
-# Pesquisa na Web Automatica para o Groq (DuckDuckGo Lite)
+# Pesquisa na Web Automatica (DuckDuckGo Lite)
 # ----------------------------------------------------------------------------
-STRIP_SEARCH_WORDS = (
-    "pesquise na internet sobre ", "pesquise na internet ", "pesquise na web sobre ", "pesquise na web ",
-    "na internet sobre ", "na internet ", "na web sobre ", "na web ",
-    "pesquise sobre ", "pesquise ", "busque sobre ", "busque ", "procure sobre ", "procure ",
-    "quero saber sobre ", "quero saber ", "me fale sobre ", "fale sobre ", "me diga sobre ", "me explique ",
-)
-
-
 CONVERSATIONAL_NOISE_RE = re.compile(
     r"^\s*(?:estou de acordo|de acordo|concordo|discordo|entendi|ok|certo|beleza|legal|pois e|"
     r"outro tema(?: agora)?|outro assunto(?: agora)?|mudando de assunto|por falar nisso|"
     r"voce acha que|acha que|o que voce acha|o que acha|sera que|me diga se|quero saber se|"
     r"vale a pena pagar num|vale a pena pagar em um|vale a pena comprar um|vale a pena|"
-    r"esta equivocado|esta errado|isso esta errado|pesquise melhor|procure melhor|"
-    r"pesquise na internet sobre|pesquise na internet|pesquise sobre|pesquise|busque sobre|busque|"
-    r"procure sobre|procure|quero saber sobre|quero saber|me fale sobre|fale sobre|me explique)\b[\s,!?.:-]*",
+    r"isso esta incorreto|isso esta errado|esta incorreto|esta equivocado|esta errado|voce errou|nao foi isso|nao e isso|"
+    r"ja ocorreram|ja ocorreu|ja aconteceram|ja aconteceu|ja teve|ja passaram|"
+    r"faca uma pesquisa completa sobre|faca uma pesquisa sobre|faca uma pesquisa|"
+    r"pesquise novamente o que eu pedi|pesquise novamente|pesquise de novo|pesquise melhor|procure melhor|procure novamente|"
+    r"pesquise na internet sobre|pesquise na internet|pesquise na web sobre|pesquise na web|"
+    r"pesquise sobre|pesquise|busque sobre|busque|procure sobre|procure|"
+    r"quero saber sobre|quero saber as|quero saber os|quero saber de|quero saber|"
+    r"e qual foi a|e qual foi o|qual foi a|qual foi o|e quais foram|quais foram|e como foi|"
+    r"me fale sobre|fale sobre|me diga sobre|me diga|me explique|o que eu pedi|novamente|de novo)\b[\s,!?.:-]*",
     re.I,
 )
 
 
 def _extract_search_keywords(text):
-    """Limpa muletas de conversa do inicio da frase para gerar uma consulta de busca limpa."""
+    """Limpa muletas de conversa, correcoes ('esta incorreto', 'ja ocorreram') e comandos ('pesquise') da consulta."""
     t = (text or "").strip()
-    # Remove acentos temporariamente so para casar regex, ou aplica direto e limpa
-    for _ in range(5):
+    for _ in range(8):
         norm = _normalize(t)
         m = CONVERSATIONAL_NOISE_RE.match(norm)
         if not m:
             break
         words = len(m.group(0).strip().split())
         t = " ".join(t.split()[words:]).strip(" ,!?.:-")
-    # Se falar de apto/imovel/m2, adiciona 'preco metro quadrado' e remove o preco do proprio usuario
-    # (ex: "350 mil") da busca para nao enviesar os resultados do buscador!
+    # Tambem limpa sufixos de comando no final da frase (ex: "..., pesquise", "..., pesquise novamente")
+    t = re.sub(
+        r"[\s,!?.:-]+\b(?:pesquise(?: novamente| de novo| melhor)?|procure(?: novamente| melhor)?|o que eu pedi)\s*[!?.]*$",
+        "",
+        t,
+        flags=re.I,
+    ).strip(" ,!?.:-")
+
     norm_t = _normalize(t)
+    if not norm_t:
+        return ""
+
+    # Se falar de apto/imovel/m2, adiciona 'preco metro quadrado' e remove o preco do proprio usuario
     if any(w in norm_t for w in ("apto", "apartamento", "imovel", "casa")) and (
-        "m2" in norm_t or "metro" in norm_t or "mil" in norm_t
+        "m2" in norm_t or "metro" in norm_t or "mil" in norm_t or "k" in norm_t.split()
     ):
-        t = re.sub(r",?\s*(?:por\s+|de\s+)?(?:r\$\s*)?\d+\s*mil(?:hao|hoes)?\b", "", t, flags=re.I).strip(" ,!?.:-")
+        t = re.sub(r",?\s*(?:por\s+|de\s+)?(?:r\$\s*)?\d+\s*(?:mil(?:hao|hoes)?|k)\b", "", t, flags=re.I).strip(
+            " ,!?.:-"
+        )
         if "preco" not in norm_t and "valor" not in norm_t:
             t = f"preco metro quadrado {t}"
-    return t or (text or "").strip()
+
+    # Se perguntar sobre "turnos" no plural, expande para "primeiro turno e segundo turno"
+    if "turnos" in norm_t.split() and "primeiro" not in norm_t:
+        t = re.sub(r"\b(?:os\s+)?turnos\b", "primeiro turno e segundo turno", t, flags=re.I)
+
+    # Se perguntar sobre "ultimas", "atual", "hoje", "eleicoes" sem citar um ano, anexa o ano atual (ex: 2026)
+    _, ano_atual = _current_br_date()
+    if not re.search(r"\b(?:19|20)\d{2}\b", norm_t) and any(
+        w in norm_t.split()
+        for w in ("ultimas", "ultima", "atuais", "atual", "hoje", "agora", "recentes", "recente", "eleicoes", "eleicao")
+    ):
+        t = re.sub(r"\b(?:das\s+|dos\s+|nas\s+|nos\s+|as\s+|os\s+)?(?:ultimas|ultima|últimeas|últimas|última)\b", "", t, flags=re.I)
+        t = re.sub(r"\s+", " ", f"{t} {ano_atual}").strip()
+    return t.strip()
 
 
-def build_search_query(history, user_text):
-    """Monta a consulta de pesquisa combinando o contexto recente quando a fala e curta."""
+def _dedupe_words(text):
+    seen = set()
+    out = []
+    for w in text.split():
+        lw = _normalize(w)
+        if lw and lw in seen and (lw.isdigit() or (len(lw) > 4 and lw != "turno")):
+            continue
+        if lw:
+            seen.add(lw)
+        out.append(w)
+    return " ".join(out)
+
+
+def build_search_query(history, user_text, fallback_topic=""):
+    """Monta a consulta de pesquisa combinando o contexto recente quando a fala e curta ou apenas 'pesquise'."""
     q = _extract_search_keywords(user_text)
-    if len(q.split()) <= 6 and history:
-        prev_users = [_extract_search_keywords(m.get("content", "")) for m in history if m.get("role") == "user"]
-        if prev_users:
-            recent = " ".join(prev_users[-2:])
-            q = f"{recent} {q}".strip()
-    return q[:180]
+    if len(q.split()) <= 5:
+        prev_clean = []
+        if history:
+            for m in history:
+                if m.get("role") == "user":
+                    kw = _extract_search_keywords(m.get("content", ""))
+                    if kw:
+                        prev_clean.append(kw)
+        if fallback_topic:
+            fb_kw = _extract_search_keywords(fallback_topic)
+            if fb_kw and (not prev_clean or prev_clean[-1] != fb_kw):
+                prev_clean.append(fb_kw)
+        if prev_clean:
+            recent = prev_clean[-1]
+            # Se o usuario especificou um novo ano (ex: "2026"), substitui anos antigos no contexto
+            new_years = re.findall(r"\b(?:19|20)\d{2}\b", q)
+            if new_years:
+                recent = re.sub(r"\b(?:19|20)\d{2}\b", new_years[-1], recent)
+            q = _dedupe_words(f"{recent} {q}".strip())
+    return (q or (user_text or "").strip())[:180]
+
+
+_search_cache = {}
+_last_nonempty_snippets = ""
+_DDG_UAS = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+)
 
 
 def fetch_web_snippets(query, timeout=WEB_SEARCH_TIMEOUT, max_results=WEB_SEARCH_MAX_RESULTS):
-    """Busca trechos atualizados no DuckDuckGo Lite (~0.4s) sem consumir cota do Groq."""
+    """Busca trechos atualizados no DuckDuckGo Lite (~0.4s) com cache e retentativa anti-202."""
+    global _last_nonempty_snippets
     if not WEB_SEARCH_ENABLED or not query or len(query.strip()) < 2:
         return ""
-    try:
-        url = "https://lite.duckduckgo.com/lite/"
-        data = urllib.parse.urlencode({"q": query}).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", "ignore")
-        titles = re.findall(r"<a rel=\"nofollow\" href=\"[^\"]+\" class='result-link'>(.*?)</a>", raw, re.S)
-        snippets = re.findall(r"<td class='result-snippet'>(.*?)</td>", raw, re.S)
-        out = []
-        for idx, s in enumerate(snippets[:max_results]):
-            t_clean = html.unescape(re.sub(r"<[^>]+>", "", titles[idx])).strip() if idx < len(titles) else ""
-            s_clean = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", s))).strip()
-            if s_clean:
-                out.append(f"- {t_clean}: {s_clean}" if t_clean else f"- {s_clean}")
-        return "\n".join(out)
-    except Exception as e:
-        logger.warning("Busca web DuckDuckGo falhou (%s): %s", query, e)
-        return ""
+    norm_q = _normalize(query)
+    cached = _search_cache.get(norm_q)
+    if cached and (time.monotonic() - cached[0]) < 300.0:
+        return cached[1]
+
+    url = "https://lite.duckduckgo.com/lite/"
+    data = urllib.parse.urlencode({"q": query, "kl": "br-pt"}).encode("utf-8")
+    for attempt in range(2):
+        try:
+            ua = _DDG_UAS[(hash(norm_q) + attempt) % len(_DDG_UAS)]
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={
+                    "User-Agent": ua,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept-Language": "pt-BR,pt;q=0.9",
+                    "Referer": "https://lite.duckduckgo.com/",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=max(0.8, timeout / (attempt + 1))) as resp:
+                raw = resp.read().decode("utf-8", "ignore")
+            titles = re.findall(r"<a rel=\"nofollow\" href=\"[^\"]+\" class='result-link'>(.*?)</a>", raw, re.S)
+            snippets = re.findall(r"<td class='result-snippet'>(.*?)</td>", raw, re.S)
+            out = []
+            for idx, s in enumerate(snippets[:max_results]):
+                t_clean = html.unescape(re.sub(r"<[^>]+>", "", titles[idx])).strip() if idx < len(titles) else ""
+                s_clean = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", s))).strip()
+                if s_clean:
+                    out.append(f"- {t_clean}: {s_clean}" if t_clean else f"- {s_clean}")
+            if out:
+                res = "\n".join(out)
+                _search_cache[norm_q] = (time.monotonic(), res)
+                _last_nonempty_snippets = res
+                return res
+            if attempt == 0:
+                time.sleep(0.25)
+        except Exception as e:
+            logger.warning("Busca web DuckDuckGo falhou (%s): %s", query, e)
+    return _last_nonempty_snippets
 
 
 # ----------------------------------------------------------------------------
@@ -455,13 +569,15 @@ class AIError(Exception):
     pass
 
 
-def _post_chat(model, messages, api_key, timeout):
+def _post_chat(model, messages, api_key, timeout, max_tokens=MAX_TOKENS):
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": MAX_TOKENS,
-        "temperature": 0.5,
+        "max_tokens": max_tokens,
+        "temperature": 0.3,
     }
+    if "gpt-oss" in model:
+        payload["reasoning_effort"] = "low"
     req = urllib.request.Request(
         f"{BASE_URL}/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -494,7 +610,7 @@ def _start_cooldown(model, http_error):
     logger.warning("Modelo %s em cooldown por %.0fs (429)", model, wait)
 
 
-def ask_groq(history, user_text, deadline=None):
+def ask_groq(history, user_text, deadline=None, search_query="", web_snippets=""):
     """Enriquece a pergunta com pesquisa DuckDuckGo e chama a cascata do Groq."""
     global _last_engine_used
     api_key = _load_api_key()
@@ -503,21 +619,25 @@ def ask_groq(history, user_text, deadline=None):
 
     deadline = deadline or (time.monotonic() + TOTAL_BUDGET_SECONDS)
 
-    search_query = build_search_query(history, user_text)
-    web_snippets = ""
-    if WEB_SEARCH_ENABLED and (deadline - time.monotonic()) > 2.8:
+    if not search_query:
+        search_query = build_search_query(history, user_text)
+    if not web_snippets and WEB_SEARCH_ENABLED and (deadline - time.monotonic()) > 2.2:
         web_snippets = fetch_web_snippets(
-            search_query, timeout=min(WEB_SEARCH_TIMEOUT, deadline - time.monotonic() - 1.5)
+            search_query, timeout=min(WEB_SEARCH_TIMEOUT, deadline - time.monotonic() - 1.2)
         )
 
-    augmented_user = user_text
+    effective_question = user_text
+    if not _extract_search_keywords(user_text) and search_query:
+        effective_question = f"{user_text} (Assunto: {search_query})"
+
+    augmented_user = effective_question
     if web_snippets:
         augmented_user = (
-            f"Fala do usuario (pode ter tido a primeira palavra cortada pela Alexa): \"{user_text}\"\n\n"
+            f"Fala do usuário (pode ter tido a primeira palavra cortada pela Alexa): \"{effective_question}\"\n\n"
             f"[Resultados de pesquisa na web para \"{search_query}\":\n{web_snippets}]"
         )
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [
+    messages = [{"role": "system", "content": get_system_prompt()}] + history + [
         {"role": "user", "content": augmented_user}
     ]
 
@@ -527,10 +647,10 @@ def ask_groq(history, user_text, deadline=None):
     timed_out = False
     for model in candidates:
         remaining = deadline - time.monotonic()
-        if remaining < 0.7:
+        if remaining < 0.6:
             break
         try:
-            ans = _post_chat(model, messages, api_key, timeout=min(remaining, 5.5))
+            ans = _post_chat(model, messages, api_key, timeout=min(remaining, 4.5))
             _last_engine_used = f"Groq ({model.split('/')[-1]})"
             return ans
         except urllib.error.HTTPError as e:
@@ -545,6 +665,26 @@ def ask_groq(history, user_text, deadline=None):
         except (AIError, KeyError, IndexError, ValueError) as e:
             last_err = e
             logger.warning("Modelo %s resposta invalida: %s", model, e)
+
+    # Segunda passada compacta (menos tokens reservados) caso todos tenham batido 429 por limite de TPD/TPM
+    if (deadline - time.monotonic()) > 1.4:
+        time.sleep(0.5)
+        compact_user = effective_question
+        if web_snippets:
+            compact_user = f"Pergunta: \"{effective_question}\"\n[Pesquisa web:\n{web_snippets[:650]}]"
+        compact_msgs = [{"role": "system", "content": get_system_prompt()}] + history[-2:] + [
+            {"role": "user", "content": compact_user}
+        ]
+        for model in sorted(MODELS, key=lambda m: _cooldown_until.get(m, 0)):
+            remaining = deadline - time.monotonic()
+            if remaining < 0.6:
+                break
+            try:
+                ans = _post_chat(model, compact_msgs, api_key, timeout=min(remaining, 3.5), max_tokens=140)
+                _last_engine_used = f"Groq ({model.split('/')[-1]})"
+                return ans
+            except Exception as e:
+                last_err = e
     raise AIError("TIMEOUT" if timed_out else f"FAILED: {last_err}")
 
 
@@ -554,26 +694,66 @@ def ask_ai(history, user_text, **kwargs):
     provider = kwargs.get("provider") or DEFAULT_PROVIDER
     budget = kwargs.get("budget") or 14.0  # permite pesquisas profundas de ate 14s com refresh!
     deadline = kwargs.get("deadline") or (time.monotonic() + budget)
+    fallback_topic = kwargs.get("fallback_topic") or ""
+
+    # Dispara o aquecimento do Gemini em paralelo com a busca DuckDuckGo (container ativo, sem congelar socket!)
+    warmup_gemini_background()
+
+    search_query = build_search_query(history, user_text, fallback_topic=fallback_topic)
+    web_snippets = ""
+    if WEB_SEARCH_ENABLED and (deadline - time.monotonic()) > 3.0:
+        web_snippets = fetch_web_snippets(
+            search_query, timeout=min(WEB_SEARCH_TIMEOUT, deadline - time.monotonic() - 2.0)
+        )
+
+    effective_question = user_text
+    if not _extract_search_keywords(user_text) and search_query:
+        effective_question = f"{user_text} (Assunto: {search_query})"
 
     if provider == "gemini":
         try:
-            gem_timeout = max(4.0, deadline - time.monotonic() - 1.2)
-            ans = ask_gemini(history, user_text, timeout=gem_timeout)
+            # Reserva pelo menos 3.2s do orcamento para o fallback Groq caso o Gemini falhe!
+            gem_timeout = max(4.0, min(11.5, deadline - time.monotonic() - 3.2))
+            ans = ask_gemini(
+                history,
+                effective_question,
+                timeout=gem_timeout,
+                search_query=search_query,
+                web_snippets=web_snippets,
+            )
             _last_engine_used = "Google Gemini"
             return ans
         except Exception as e:
             logger.warning("Gemini falhou/demorou (%s); fazendo fallback automatico para Groq.", e)
             try:
-                return ask_groq(history, user_text, deadline=deadline)
+                return ask_groq(
+                    history,
+                    effective_question,
+                    deadline=deadline,
+                    search_query=search_query,
+                    web_snippets=web_snippets,
+                )
             except Exception as groq_e:
                 raise AIError(f"Gemini ({e}) e fallback Groq ({groq_e})")
     else:
         try:
-            return ask_groq(history, user_text, deadline=deadline)
+            return ask_groq(
+                history,
+                effective_question,
+                deadline=deadline,
+                search_query=search_query,
+                web_snippets=web_snippets,
+            )
         except AIError as e:
             if str(e) != "NO_KEY" and (deadline - time.monotonic()) > 2.5:
                 try:
-                    ans = ask_gemini(history, user_text, timeout=deadline - time.monotonic())
+                    ans = ask_gemini(
+                        history,
+                        effective_question,
+                        timeout=deadline - time.monotonic(),
+                        search_query=search_query,
+                        web_snippets=web_snippets,
+                    )
                     _last_engine_used = "Google Gemini (fallback)"
                     return ans
                 except Exception:
@@ -735,6 +915,7 @@ def _converse(handler_input, text):
         return _ask(handler_input, MSG_HELP)
     if is_reset_command(text):
         _pending_tasks.pop(user_id, None)
+        _last_topic_by_user.pop(user_id, None)
         clear_history(handler_input)
         return _ask(handler_input, MSG_RESET)
 
@@ -744,7 +925,6 @@ def _converse(handler_input, text):
         _pending_tasks.pop(user_id, None)
         save_user_state(handler_input, provider=new_provider)
         if new_provider == "gemini":
-            warmup_gemini_background()
             return _ask(handler_input, "Pronto! Mudei o cérebro principal para o Google Gemini. Pode perguntar!")
         return _ask(handler_input, "Pronto! Mudei o cérebro principal para o Groq. Pode perguntar!")
 
@@ -783,8 +963,19 @@ def _converse(handler_input, text):
 
     # Nova pergunta: dispara em background com orcamento amplo (14s) e monitora o relogio
     _pending_tasks.pop(user_id, None)
+    prev_topic = _last_topic_by_user.get(user_id, "")
+    clean_kw = _extract_search_keywords(text)
+    if clean_kw:
+        _last_topic_by_user[user_id] = build_search_query(history, text, fallback_topic=prev_topic)
     context = select_context(history)
-    fut = _get_executor().submit(ask_ai, context, text, provider=provider, budget=14.0)
+    fut = _get_executor().submit(
+        ask_ai,
+        context,
+        text,
+        provider=provider,
+        budget=(17.0 if provider == "gemini" else 14.0),
+        fallback_topic=prev_topic,
+    )
     try:
         answer, finished = _wait_with_progressive(handler_input, fut, req_start)
         if not finished:
@@ -817,7 +1008,6 @@ class LaunchRequestHandler(AbstractRequestHandler):
         return ask_utils.is_request_type("LaunchRequest")(handler_input)
 
     def handle(self, handler_input):
-        warmup_gemini_background()
         return _ask(handler_input, MSG_WELCOME)
 
 
