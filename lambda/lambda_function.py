@@ -10,6 +10,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -61,22 +62,23 @@ DEFAULT_COOLDOWN = 60.0
 _last_engine_used = None  # registra exatamente quem gerou a ultima resposta (ex: "Google Gemini" ou "Groq (gpt-oss-120b)")
 
 SYSTEM_PROMPT = (
-    "Voce e a Super Alexa, uma assistente de voz inteligente, simpatica e direta. "
-    "Responda sempre em portugues do Brasil, de forma curta e natural para ser falada em voz alta "
-    "(no maximo 2 ou 3 frases curtas, a menos que o usuario peca mais detalhes). "
-    "NAO use markdown, listas com marcadores, asteriscos, emojis, tabelas ou links. "
-    "Se precisar enumerar, use frases corridas. Use o historico da conversa para manter o contexto. "
-    "IMPORTANTE SOBRE FRASES CORTADAS E CONTINUACOES: A Alexa as vezes remove a primeira palavra da frase "
-    "do usuario (como 'é um', 'pesquise', 'quero saber', 'sobre', 'como') ou o usuario responde com uma "
-    "palavra solta ou complemento curto (ex: 'Ronin', 'um jogo j2me', 'e ele?'). Se a fala atual tiver relacao "
-    "com o assunto anterior, reconstrua o sentido combinando com o historico; mas se for uma pergunta sobre "
-    "uma nova pessoa ou novo assunto sem relacao com o anterior, trate como um assunto novo do zero e NAO "
+    "Você é a Super Alexa, uma assistente de voz inteligente, simpática e direta. "
+    "Responda SEMPRE em português do Brasil com acentuação ortográfica correta e completa "
+    "(use sempre á, é, í, ó, ú, ã, õ, ç, ê, ô corretamente para que a síntese de voz pronuncie bem), "
+    "de forma curta e natural para ser falada em voz alta (no máximo 2 ou 3 frases curtas, a menos que o usuário peça mais detalhes). "
+    "NÃO use markdown, listas com marcadores, asteriscos, emojis, tabelas ou links. "
+    "Se precisar enumerar, use frases corridas. Use o histórico da conversa para manter o contexto. "
+    "IMPORTANTE SOBRE FRASES CORTADAS E CONTINUAÇÕES: A Alexa às vezes remove a primeira palavra da frase "
+    "do usuário (como 'é um', 'pesquise', 'quero saber', 'sobre', 'como') ou o usuário responde com uma "
+    "palavra solta ou complemento curto (ex: 'Ronin', 'um jogo j2me', 'e ele?'). Se a fala atual tiver relação "
+    "com o assunto anterior, reconstrua o sentido combinando com o histórico; mas se for uma pergunta sobre "
+    "uma nova pessoa ou novo assunto sem relação com o anterior, trate como um assunto novo do zero e NÃO "
     "misture com o tema antigo! "
     "IMPORTANTE SOBRE PESQUISA NA WEB: Use os dados de pesquisa na web fornecidos (ou sua busca Google nativa) "
-    "para responder sobre fatos recentes, eleicoes, noticias, pessoas, empresas ou jogos especificos com precisao. "
-    "NUNCA invente fatos. Se nao encontrar informacao confiavel, diga isso com honestidade e peca mais detalhes. "
-    "Voce NAO controla dispositivos, musicas, alarmes ou casa inteligente; se pedirem isso, "
-    "explique gentilmente que nesta skill voce so conversa."
+    "para responder sobre fatos recentes, eleições, notícias, pessoas, empresas ou jogos específicos com precisão. "
+    "NUNCA invente fatos. Se não encontrar informação confiável, diga isso com honestidade e peça mais detalhes. "
+    "Você NÃO controla dispositivos, músicas, alarmes ou casa inteligente; se pedirem isso, "
+    "explique gentilmente que nesta skill você só conversa."
 )
 
 RESET_PHRASES = (
@@ -115,15 +117,15 @@ STOP_WORDS = {"parar", "para", "pare", "sair", "tchau", "cancelar", "cancela", "
 HELP_WORDS = {"ajuda", "me ajuda", "socorro"}
 MSG_REPROMPT = "Pode continuar, estou ouvindo."
 MSG_HELP = (
-    "Eu sou uma assistente com inteligencia artificial e pesquisa na web. Faca qualquer pergunta "
-    "e continue a conversa normalmente. Voce pode dizer: usar gemini, ou usar groq, para escolher o cerebro. "
-    "Para apagar minha memoria, diga: nova conversa. Para sair, diga: parar."
+    "Eu sou uma assistente com inteligência artificial e pesquisa na web. Faça qualquer pergunta "
+    "e continue a conversa normalmente. Você pode dizer: usar gemini, ou usar groq, para escolher o cérebro. "
+    "Para apagar minha memória, diga: nova conversa. Para sair, diga: parar."
 )
-MSG_RESET = "Pronto, apaguei a memoria. Vamos comecar uma nova conversa!"
-MSG_BYE = "Ate logo!"
+MSG_RESET = "Pronto, apaguei a memória. Vamos começar uma nova conversa!"
+MSG_BYE = "Até logo!"
 MSG_ERROR = "Desculpe, tive um problema para pensar na resposta. Pode repetir?"
 MSG_TIMEOUT = "Desculpe, a resposta demorou demais. Pode perguntar de novo?"
-MSG_NO_KEY = "A chave da inteligencia artificial nao esta configurada. Verifique a configuracao da skill."
+MSG_NO_KEY = "A chave da inteligência artificial não está configurada. Verifique a configuração da skill."
 
 
 def _load_secrets():
@@ -205,14 +207,14 @@ def build_gemini_prompt(history, user_text):
     if history:
         lines = []
         for m in history[-8:]:
-            role = "Usuario" if m.get("role") == "user" else "Assistente"
+            role = "Usuário" if m.get("role") == "user" else "Assistente"
             lines.append(f"{role}: {m.get('content', '')}")
-        ctx = "Historico recente da conversa:\n" + "\n".join(lines) + "\n\n"
+        ctx = "Histórico recente da conversa:\n" + "\n".join(lines) + "\n\n"
     return (
         f"{SYSTEM_PROMPT}\n\n"
         f"{ctx}"
-        f"Nova fala do usuario (pode ter tido a primeira palavra cortada pela Alexa): {user_text}\n\n"
-        "Responda agora em portugues do Brasil em no maximo 2 ou 3 frases curtas para voz, sem markdown:"
+        f"Nova fala do usuário (pode ter tido a primeira palavra cortada pela Alexa): {user_text}\n\n"
+        "Responda agora em português do Brasil (com acentuação correta) em no máximo 2 ou 3 frases curtas para voz, sem markdown:"
     )
 
 
@@ -291,7 +293,8 @@ def is_status_command(text):
 
 
 def clean_for_speech(text):
-    """Remove markdown/emojis/citacoes/tags e escapa para SSML."""
+    """Normaliza acentuacao (NFC), remove markdown/emojis/citacoes/tags e escapa para SSML."""
+    text = unicodedata.normalize("NFC", text or "")
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
     text = re.sub(r"<[A-Za-z]+[^>]*>.*?</[A-Za-z]+>", "", text, flags=re.S)
     text = re.sub(r"<[A-Za-z]+[^>]*/>", "", text)
@@ -605,7 +608,7 @@ def _converse(handler_input, text):
     """Fluxo principal: processa uma fala do usuario."""
     text = (text or "").strip()
     if not text:
-        return _ask(handler_input, "Nao entendi. Pode repetir?")
+        return _ask(handler_input, "Não entendi. Pode repetir?")
 
     norm = _normalize(text)
     if norm in STOP_WORDS:
@@ -622,17 +625,17 @@ def _converse(handler_input, text):
         save_user_state(handler_input, provider=new_provider)
         if new_provider == "gemini":
             warmup_gemini(max_wait=5.5)
-            return _ask(handler_input, "Pronto! Mudei o cerebro principal para o Google Gemini. Pode perguntar!")
-        return _ask(handler_input, "Pronto! Mudei o cerebro principal para o Groq. Pode perguntar!")
+            return _ask(handler_input, "Pronto! Mudei o cérebro principal para o Google Gemini. Pode perguntar!")
+        return _ask(handler_input, "Pronto! Mudei o cérebro principal para o Groq. Pode perguntar!")
 
     history, provider = get_user_state(handler_input)
 
     if is_status_command(text):
         nome = "Google Gemini" if provider == "gemini" else "Groq"
-        detalhe = f" A ultima resposta foi gerada por {_last_engine_used}." if _last_engine_used else ""
+        detalhe = f" A última resposta foi gerada por {_last_engine_used}." if _last_engine_used else ""
         return _ask(
             handler_input,
-            f"O cerebro principal configurado e o {nome}.{detalhe} Para trocar, diga: usar gemini, ou usar groq.",
+            f"O cérebro principal configurado é o {nome}.{detalhe} Para trocar, diga: usar gemini, ou usar groq.",
         )
 
     context = select_context(history)
@@ -714,7 +717,7 @@ class FallbackIntentHandler(AbstractRequestHandler):
     def handle(self, handler_input):
         return _ask(
             handler_input,
-            "Nao consegui ouvir direito. Pode repetir comecando com: me diga, ou quero saber?",
+            "Não consegui ouvir direito. Pode repetir começando com: me diga, ou quero saber?",
         )
 
 
