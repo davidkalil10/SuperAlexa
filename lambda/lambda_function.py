@@ -65,8 +65,9 @@ _last_engine_used = None  # registra exatamente quem gerou a ultima resposta (ex
 # Tarefas de pesquisa longa em andamento por usuario: {user_id: {"future": fut, "question": str, "provider": str, "started": float}}
 _pending_tasks = {}
 _executor = None
-PROGRESSIVE_WAIT_SECONDS = 2.2
-HOLD_WAIT_SECONDS = 4.4  # 2.2s + 4.4s = 6.6s (margem segura antes dos 8s da Alexa)
+_request_start_time = 0.0
+PROGRESSIVE_WAIT_SECONDS = 2.0
+MAX_LAMBDA_SAFE_SECONDS = 5.6  # margem segura para NUNCA estourar os 8s do container AWS Lambda (mesmo em cold start)
 CONTINUE_PHRASES = (
     "continuar", "continue", "pode continuar", "pronto", "ok", "pode falar",
     "diga", "me diga", "fale", "e ai", "terminou", "ja terminou", "ler resposta",
@@ -198,8 +199,27 @@ async def _init_gemini_async():
     logger.info("Gemini Web inicializado com sucesso (autenticado=%s).", bool(psid))
 
 
-def warmup_gemini(max_wait=6.2):
-    """Inicializa o Gemini ANTES do Lambda retornar (a AWS congela threads em background apos o retorno!)."""
+def warmup_gemini_background():
+    """Dispara a inicializacao do Gemini em background sem travar a resposta da Alexa."""
+    if _gemini_ready:
+        return
+
+    def _runner():
+        with _gemini_lock:
+            if _gemini_ready:
+                return
+            try:
+                loop = _ensure_gemini_loop()
+                fut = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
+                fut.result(timeout=15)
+            except Exception as e:
+                logger.warning("Aquecimento do Gemini em background falhou: %s", e)
+
+    threading.Thread(target=_runner, daemon=True).start()
+
+
+def warmup_gemini(max_wait=5.0):
+    """Aguarda a inicializacao do Gemini ate max_wait segundos."""
     if _gemini_ready:
         return True
     with _gemini_lock:
@@ -667,20 +687,25 @@ def _get_user_id(handler_input):
         return "default"
 
 
-def _wait_with_progressive(handler_input, future):
-    """Aguarda a tarefa: em 2.2s manda 'Estou pesquisando...'; espera mais 4.4s (total 6.6s)."""
+def _wait_with_progressive(handler_input, future, req_start):
+    """Aguarda a tarefa respeitando o tempo total do Lambda (MAX_LAMBDA_SAFE_SECONDS)."""
+    elapsed = time.monotonic() - req_start
+    wait1 = max(0.2, min(PROGRESSIVE_WAIT_SECONDS, MAX_LAMBDA_SAFE_SECONDS - elapsed - 0.5))
     try:
-        return future.result(timeout=PROGRESSIVE_WAIT_SECONDS), True
+        return future.result(timeout=wait1), True
     except concurrent.futures.TimeoutError:
         send_progressive_speech(handler_input, MSG_PROGRESSIVE)
+        elapsed = time.monotonic() - req_start
+        wait2 = max(0.2, MAX_LAMBDA_SAFE_SECONDS - elapsed)
         try:
-            return future.result(timeout=HOLD_WAIT_SECONDS), True
+            return future.result(timeout=wait2), True
         except concurrent.futures.TimeoutError:
             return None, False
 
 
 def _converse(handler_input, text):
     """Fluxo principal: processa uma fala do usuario com suporte a refresh de pesquisas longas."""
+    req_start = time.monotonic()
     text = (text or "").strip()
     user_id = _get_user_id(handler_input)
     pending = _pending_tasks.get(user_id)
@@ -703,7 +728,7 @@ def _converse(handler_input, text):
         _pending_tasks.pop(user_id, None)
         save_user_state(handler_input, provider=new_provider)
         if new_provider == "gemini":
-            warmup_gemini(max_wait=5.5)
+            warmup_gemini_background()
             return _ask(handler_input, "Pronto! Mudei o cérebro principal para o Google Gemini. Pode perguntar!")
         return _ask(handler_input, "Pronto! Mudei o cérebro principal para o Groq. Pode perguntar!")
 
@@ -723,7 +748,7 @@ def _converse(handler_input, text):
         fut = pending["future"]
         orig_question = pending["question"]
         try:
-            answer, finished = _wait_with_progressive(handler_input, fut)
+            answer, finished = _wait_with_progressive(handler_input, fut, req_start)
             if not finished:
                 # Ainda processando: pede mais um 'continuar' para ganhar mais 8s
                 return _ask(handler_input, "Ainda estou concluindo a pesquisa, diga: continuar, só mais uma vez!")
@@ -745,9 +770,9 @@ def _converse(handler_input, text):
     context = select_context(history)
     fut = _get_executor().submit(ask_ai, context, text, provider=provider, budget=14.0)
     try:
-        answer, finished = _wait_with_progressive(handler_input, fut)
+        answer, finished = _wait_with_progressive(handler_input, fut, req_start)
         if not finished:
-            # Bateu 6.6s e a IA ainda esta pesquisando: guarda a tarefa e faz o refresh com o usuario!
+            # Bateu 5.6s e a IA ainda esta pesquisando: guarda a tarefa e faz o refresh com o usuario!
             _pending_tasks[user_id] = {
                 "future": fut,
                 "question": text,
@@ -776,9 +801,7 @@ class LaunchRequestHandler(AbstractRequestHandler):
         return ask_utils.is_request_type("LaunchRequest")(handler_input)
 
     def handle(self, handler_input):
-        _, provider = get_user_state(handler_input)
-        if provider == "gemini":
-            warmup_gemini(max_wait=5.8)
+        warmup_gemini_background()
         return _ask(handler_input, MSG_WELCOME)
 
 
