@@ -35,8 +35,8 @@ logger.setLevel(logging.INFO)
 DEFAULT_PROVIDER = os.environ.get("AI_DEFAULT_PROVIDER", "groq").strip().lower()  # "groq" (rapido) ou "gemini"
 BASE_URL = os.environ.get("AI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 DEFAULT_MODELS = [
-    "qwen/qwen3.8-27b",
     "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
     "openai/gpt-oss-20b",
     "openai/gpt-oss-safeguard-20b",
     "allam-2-7b",
@@ -46,11 +46,10 @@ MODELS = [m.strip() for m in os.environ.get("AI_MODELS", "").split(",") if m.str
 # Memoria: guardamos TUDO no DynamoDB ate este teto de bytes (item maximo = 400 KB);
 # so ao estourar o teto descartamos as mensagens mais antigas.
 MAX_STORED_BYTES = int(os.environ.get("MAX_STORED_BYTES", str(300 * 1024)))
-# Para a IA enviamos apenas as mensagens mais recentes que cabem neste orcamento de caracteres
-# (2400 chars ~ 600 tokens: evita estourar o limite de TPD/TPM do plano gratuito da Groq!).
-CONTEXT_CHAR_BUDGET = int(os.environ.get("CONTEXT_CHAR_BUDGET", "2400"))
-MAX_CONTEXT_TURNS = int(os.environ.get("MAX_CONTEXT_TURNS", "6"))  # ultimas 6 mensagens (3 trocas completas)
-MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "240"))
+# Para a IA enviamos as mensagens recentes completas; so reduzimos no fallback se bater 429.
+CONTEXT_CHAR_BUDGET = int(os.environ.get("CONTEXT_CHAR_BUDGET", "3500"))
+MAX_CONTEXT_TURNS = int(os.environ.get("MAX_CONTEXT_TURNS", "8"))  # ultimas 8 mensagens (4 trocas completas)
+MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "600"))
 # A Alexa derruba a resposta apos ~8s; deixamos margem.
 TOTAL_BUDGET_SECONDS = float(os.environ.get("AI_TOTAL_BUDGET", "7.2"))
 GEMINI_BUDGET_SECONDS = float(os.environ.get("GEMINI_BUDGET", "5.8"))
@@ -569,15 +568,15 @@ class AIError(Exception):
     pass
 
 
-def _post_chat(model, messages, api_key, timeout, max_tokens=MAX_TOKENS):
+def _post_chat(model, messages, api_key, timeout, max_tokens=MAX_TOKENS, reasoning_effort="medium"):
     payload = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": 0.3,
+        "temperature": 0.4,
     }
-    if "gpt-oss" in model:
-        payload["reasoning_effort"] = "low"
+    if "gpt-oss" in model and reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
     req = urllib.request.Request(
         f"{BASE_URL}/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -680,7 +679,9 @@ def ask_groq(history, user_text, deadline=None, search_query="", web_snippets=""
             if remaining < 0.6:
                 break
             try:
-                ans = _post_chat(model, compact_msgs, api_key, timeout=min(remaining, 3.5), max_tokens=140)
+                ans = _post_chat(
+                    model, compact_msgs, api_key, timeout=min(remaining, 3.5), max_tokens=200, reasoning_effort="low"
+                )
                 _last_engine_used = f"Groq ({model.split('/')[-1]})"
                 return ans
             except Exception as e:
