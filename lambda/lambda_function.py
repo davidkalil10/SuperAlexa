@@ -297,14 +297,11 @@ async def _init_gemini_async():
     if _gemini_ready and _gemini_client is not None:
         return
     if _gemini_init_task is not None and not _gemini_init_task.done():
-        if (time.monotonic() - _gemini_init_started) <= 16.0:
+        try:
             await _gemini_init_task
             return
-        try:
-            _gemini_init_task.cancel()
         except Exception:
-            pass
-        _gemini_init_task = None
+            _gemini_init_task = None
 
     async def _do_init():
         global _gemini_client, _gemini_ready, _gemini_authenticated
@@ -355,12 +352,7 @@ async def _init_gemini_async():
 
     _gemini_init_started = time.monotonic()
     _gemini_init_task = asyncio.create_task(_do_init())
-    try:
-        await _gemini_init_task
-    except Exception:
-        _gemini_ready = False
-        _gemini_init_task = None
-        raise
+    await _gemini_init_task
 
 
 def warmup_gemini_background():
@@ -374,7 +366,7 @@ def warmup_gemini_background():
         logger.warning("Aquecimento do Gemini em background falhou: %s", e)
 
 
-def warmup_gemini(max_wait=5.0):
+def warmup_gemini(max_wait=6.8):
     """Aguarda a inicializacao do Gemini ate max_wait segundos sem cancelar se ainda estiver dentro do prazo normal (~8s)."""
     global _gemini_ready, _gemini_init_task
     if _gemini_ready and _gemini_client is not None:
@@ -383,14 +375,12 @@ def warmup_gemini(max_wait=5.0):
         loop = _ensure_gemini_loop()
         fut = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
         fut.result(timeout=max_wait)
-        return True
+        return bool(_gemini_ready and _gemini_client is not None)
     except concurrent.futures.TimeoutError:
         logger.warning("Aquecimento do Gemini ainda em andamento apos %.1fs (continua em background).", max_wait)
         return False
     except Exception as e:
         logger.warning("Aquecimento do Gemini falhou: %s", e)
-        _gemini_ready = False
-        _gemini_init_task = None
         return False
 
 
@@ -466,7 +456,7 @@ def ask_gemini(
     t0 = time.monotonic()
     loop = _ensure_gemini_loop()
     if not _gemini_ready or _gemini_client is None:
-        if not warmup_gemini(max_wait=min(6.5, max(2.5, timeout - 2.0))):
+        if not warmup_gemini(max_wait=min(6.8, max(2.5, timeout - 1.5))):
             raise AIError("GEMINI_NOT_WARMED")
 
     cfg = _load_gemini_config()
@@ -1288,7 +1278,7 @@ def _converse(handler_input, text):
             modo_hist = "salvando histórico no seu Gemini" if should_save else "em modo de chat temporário"
 
             if not _gemini_ready or _gemini_client is None:
-                warmup_gemini(max_wait=5.5)
+                warmup_gemini(max_wait=6.8)
 
             if _gemini_ready and _gemini_client is not None:
                 cands = _select_gemini_candidates(_gemini_client, cfg["preferred_model"])
@@ -1392,6 +1382,7 @@ class LaunchRequestHandler(AbstractRequestHandler):
         return ask_utils.is_request_type("LaunchRequest")(handler_input)
 
     def handle(self, handler_input):
+        warmup_gemini_background()
         return _ask(handler_input, MSG_WELCOME)
 
 
