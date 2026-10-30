@@ -149,16 +149,24 @@ SWITCH_TO_GROQ = (
 STATUS_PHRASES = (
     "qual inteligencia artificial", "qual ia", "qual modelo", "qual provedor",
     "qual inteligencia voce esta usando", "qual modelo voce esta usando", "quem e voce",
+    "qual modelo voce e", "qual seu modelo", "qual o seu modelo", "qual o modelo",
+    "que modelo voce usa", "que modelo voce esta usando", "qual inteligencia voce e",
+    "qual e o modelo", "qual e o provedor", "qual e a ia", "qual e a inteligencia",
 )
 GEMINI_HISTORY_ON_PHRASES = (
     "salvar historico no gemini", "salvar no gemini", "ativar historico do gemini",
     "ativar historico no gemini", "com historico no gemini", "gravar historico no gemini",
-    "desativar chat temporario", "desativar modo temporario",
+    "desativar chat temporario", "desativar modo temporario", "ativar gemini na minha conta",
+    "ativar o gemini na minha conta", "usar gemini na minha conta", "usar minha conta no gemini",
+    "salvar historico", "com historico", "gravar historico", "modo conta", "modo logado",
 )
 GEMINI_HISTORY_OFF_PHRASES = (
     "nao salvar historico no gemini", "nao salvar no gemini", "desativar historico do gemini",
     "desativar historico no gemini", "sem historico no gemini", "chat temporario",
     "chat temporario no gemini", "modo temporario", "modo temporario no gemini",
+    "ativar gemini anonimo", "ativar o gemini anonimo", "gemini anonimo", "usar gemini anonimo",
+    "modo anonimo", "modo anonimo no gemini", "ativar modo anonimo", "ativar o modo anonimo",
+    "sem historico", "nao salvar historico", "nao salvar", "anonimo",
 )
 
 MSG_WELCOME = "Modo super ativado! Pode falar, sobre o que vamos conversar?"
@@ -204,7 +212,7 @@ def _load_api_key():
 def _clean_cookie_val(val):
     if not val or not isinstance(val, str):
         return None
-    v = val.strip()
+    v = val.strip().strip("'\"").replace("\r", "").replace("\n", "").strip()
     if not v or v.lower().startswith(("cole_", "seu_", "sua_", "insira_")):
         return None
     return v
@@ -584,28 +592,38 @@ def detect_provider_switch(text):
 def detect_gemini_history_switch(text):
     """Detecta comando de voz para ativar/desativar o salvamento de historico na conta do Google Gemini."""
     norm = _normalize(text)
-    if len(norm.split()) > 8:
+    if len(norm.split()) > 10:
         return None
-    if any(norm == p or norm.endswith(" " + p) for p in GEMINI_HISTORY_OFF_PHRASES):
-        return False
-    if any(norm == p or norm.endswith(" " + p) for p in GEMINI_HISTORY_ON_PHRASES):
-        return True
+    for p in GEMINI_HISTORY_OFF_PHRASES:
+        if norm == p:
+            return False
+        if len(p.split()) >= 2 and p in norm:
+            return False
+        if f" {p} " in f" {norm} ":
+            return False
+    for p in GEMINI_HISTORY_ON_PHRASES:
+        if norm == p:
+            return True
+        if len(p.split()) >= 2 and p in norm:
+            return True
+        if f" {p} " in f" {norm} ":
+            return True
     return None
 
 
 def is_status_command(text):
     """Detecta perguntas sobre qual IA/modelo/provedor esta sendo usado (mesmo sem a palavra 'qual')."""
     norm = _normalize(text)
-    if len(norm.split()) > 8:
+    if len(norm.split()) > 10:
         return False
-    if any(norm == p or norm.endswith(p) for p in STATUS_PHRASES):
+    if any(norm == p or p in norm for p in STATUS_PHRASES):
         return True
     has_target = any(w in norm.split() for w in ("modelo", "ia", "provedor", "cerebro")) or (
         "inteligencia artificial" in norm
     )
     has_verb = any(
         w in norm
-        for w in ("usando", "usada", "usado", "ativo", "ativa", "atual", "voce e", "voce usa")
+        for w in ("usando", "usada", "usado", "ativo", "ativa", "atual", "voce e", "voce usa", "qual", "que")
     )
     return has_target and (has_verb or len(norm.split()) <= 3)
 
@@ -1224,17 +1242,18 @@ def _converse(handler_input, text):
     gem_hist_switch = detect_gemini_history_switch(text)
     if gem_hist_switch is not None:
         _pending_tasks.pop(user_id, None)
+        warmup_gemini_background()
         if not gem_hist_switch:
             _gemini_chat_meta_by_user.pop(user_id, None)
-            save_user_state(handler_input, gemini_save_history=False, gemini_chat_metadata=None)
+            save_user_state(handler_input, provider="gemini", gemini_save_history=False, gemini_chat_metadata=None)
             return _ask(
                 handler_input,
-                "Pronto! Ativei o modo temporário no Gemini: vou usar os modelos da sua conta, mas sem salvar no histórico do seu Google Gemini.",
+                "Pronto! Ativei o Google Gemini em modo temporário: não salvarei as conversas no seu histórico do Gemini. Pode perguntar!",
             )
-        save_user_state(handler_input, gemini_save_history=True)
+        save_user_state(handler_input, provider="gemini", gemini_save_history=True)
         return _ask(
             handler_input,
-            "Pronto! Ativei o salvamento de histórico: suas conversas com o Gemini ficarão salvas na sua conta Google.",
+            "Pronto! Ativei o Google Gemini com salvamento de histórico: suas conversas ficarão salvas na sua conta Google. Pode perguntar!",
         )
 
     # Troca de provedor por comando de voz ("usar gemini" / "usar groq")
