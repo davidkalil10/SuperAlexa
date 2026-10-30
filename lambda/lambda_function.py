@@ -58,6 +58,7 @@ WEB_SEARCH_MAX_RESULTS = int(os.environ.get("AI_WEB_SEARCH_RESULTS", "5"))
 # Cooldown de modelos com 429 (persiste enquanto o Lambda estiver "quente").
 _cooldown_until = {}
 DEFAULT_COOLDOWN = 60.0
+_last_engine_used = None  # registra exatamente quem gerou a ultima resposta (ex: "Google Gemini" ou "Groq (gpt-oss-120b)")
 
 SYSTEM_PROMPT = (
     "Voce e a Super Alexa, uma assistente de voz inteligente, simpatica e direta. "
@@ -273,8 +274,20 @@ def detect_provider_switch(text):
 
 
 def is_status_command(text):
+    """Detecta perguntas sobre qual IA/modelo/provedor esta sendo usado (mesmo sem a palavra 'qual')."""
     norm = _normalize(text)
-    return any(norm == p or norm.endswith(p) for p in STATUS_PHRASES)
+    if len(norm.split()) > 9:
+        return False
+    if any(norm == p or norm.endswith(p) for p in STATUS_PHRASES):
+        return True
+    has_target = any(w in norm.split() for w in ("modelo", "ia", "provedor", "cerebro")) or (
+        "inteligencia artificial" in norm
+    )
+    has_verb = any(
+        w in norm
+        for w in ("usando", "usada", "usado", "ativo", "ativa", "atual", "voce e", "voce usa", "esta", "qual")
+    )
+    return has_target and (has_verb or len(norm.split()) <= 3)
 
 
 def clean_for_speech(text):
@@ -468,7 +481,10 @@ def ask_groq(history, user_text, deadline=None):
         if remaining < 0.7:
             break
         try:
-            return _post_chat(model, messages, api_key, timeout=min(remaining, 5.5))
+            ans = _post_chat(model, messages, api_key, timeout=min(remaining, 5.5))
+            global _last_engine_used
+            _last_engine_used = f"Groq ({model.split('/')[-1]})"
+            return ans
         except urllib.error.HTTPError as e:
             last_err = e
             if e.code == 429:
@@ -486,13 +502,16 @@ def ask_groq(history, user_text, deadline=None):
 
 def ask_ai(history, user_text, **kwargs):
     """Orquestra a chamada usando o provedor escolhido ('gemini' ou 'groq') com fallback automatico."""
+    global _last_engine_used
     provider = kwargs.get("provider") or DEFAULT_PROVIDER
     deadline = kwargs.get("deadline") or (time.monotonic() + TOTAL_BUDGET_SECONDS)
 
     if provider == "gemini":
         try:
             gem_timeout = min(GEMINI_BUDGET_SECONDS, max(2.0, deadline - time.monotonic() - 1.4))
-            return ask_gemini(history, user_text, timeout=gem_timeout)
+            ans = ask_gemini(history, user_text, timeout=gem_timeout)
+            _last_engine_used = "Google Gemini"
+            return ans
         except Exception as e:
             logger.warning("Gemini falhou/demorou (%s); fazendo fallback automatico para Groq.", e)
             return ask_groq(history, user_text, deadline=deadline)
@@ -502,7 +521,9 @@ def ask_ai(history, user_text, **kwargs):
         except AIError as e:
             if str(e) != "NO_KEY" and (deadline - time.monotonic()) > 3.5:
                 try:
-                    return ask_gemini(history, user_text, timeout=deadline - time.monotonic())
+                    ans = ask_gemini(history, user_text, timeout=deadline - time.monotonic())
+                    _last_engine_used = "Google Gemini (fallback)"
+                    return ans
                 except Exception:
                     pass
             raise
@@ -608,9 +629,10 @@ def _converse(handler_input, text):
 
     if is_status_command(text):
         nome = "Google Gemini" if provider == "gemini" else "Groq"
+        detalhe = f" A ultima resposta foi gerada por {_last_engine_used}." if _last_engine_used else ""
         return _ask(
             handler_input,
-            f"No momento estou usando o {nome} como cerebro principal. Para trocar, basta dizer: usar gemini, ou usar groq.",
+            f"O cerebro principal configurado e o {nome}.{detalhe} Para trocar, diga: usar gemini, ou usar groq.",
         )
 
     context = select_context(history)
