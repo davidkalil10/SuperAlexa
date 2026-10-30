@@ -329,12 +329,23 @@ MSG_NO_KEY = "A chave da inteligência artificial não está configurada. Verifi
 
 
 def _load_secrets():
-    path = os.path.join(os.path.dirname(__file__), "secrets.json")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "secrets.json"),
+        os.path.join(os.getcwd(), "secrets.json"),
+        os.path.join(os.getcwd(), "lambda", "secrets.json"),
+        "/var/task/secrets.json",
+        "/var/task/lambda/secrets.json",
+    ]
+    for p in candidates:
+        try:
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if data and isinstance(data, dict):
+                        return data
+        except Exception:
+            pass
+    return {}
 
 
 def _load_api_key():
@@ -441,70 +452,39 @@ async def _init_gemini_async():
 
     _gemini_init_error = None
     from gemini_webapi import GeminiClient
-    try:
-        from gemini_webapi.constants import AccountStatus
-    except Exception:
-        class AccountStatus:
-            AVAILABLE = 1000
-            UNAUTHENTICATED = 1016
-
-    class _FastGeminiClient(GeminiClient):
-        """Otimiza o init() executando apenas _fetch_user_status (descobre modelos da conta em ~0.3s)."""
-
-        async def _init_rpc(self) -> None:
-            if hasattr(self, "_fetch_user_status"):
-                await self._fetch_user_status()
-
-        async def _sync_activity(self) -> None:
-            self.last_activity_time = time.time()
 
     psid, psidts = _load_gemini_cookies()
-    client = None
-    is_auth = False
+    if not psid:
+        _gemini_init_error = "Cookies nao configurados no secrets.json"
+        _gemini_client = None
+        _gemini_authenticated = False
+        _gemini_ready = False
+        logger.warning("Nenhum cookie __Secure-1PSID encontrado no secrets.json ou variaveis de ambiente.")
+        return
 
-    if psid:
-        try:
-            cand = _FastGeminiClient(psid, psidts)
-            await cand.init(timeout=8, auto_close=False, auto_refresh=False)
-            status_val = getattr(cand, "account_status", None)
-            is_avail = (
-                status_val == 1000
-                or getattr(status_val, "value", None) == 1000
-                or getattr(status_val, "name", "") == "AVAILABLE"
-                or (AccountStatus is not None and status_val == getattr(AccountStatus, "AVAILABLE", 1000))
-                or getattr(cand, "running", False)
-            )
-            if is_avail:
-                client = cand
-                is_auth = True
-                raw_models = cand.list_models() if hasattr(cand, "list_models") else []
-                models_info = [f"{getattr(m, 'display_name', m)} ({getattr(m, 'model_name', m)})" for m in (raw_models or []) if getattr(m, "is_available", True)]
-                logger.info("Gemini Web autenticado na conta com sucesso! Modelos disponiveis: %s", models_info)
-            else:
-                logger.warning(
-                    "Cookies do Gemini nao autenticaram (status=%s); usando sessao como anonima.",
-                    status_val,
-                )
-                client = cand
-                is_auth = False
-        except Exception as e:
-            logger.warning("Falha ao inicializar Gemini com cookies (%s); criando sessao anonima.", e)
-            _gemini_init_error = f"{type(e).__name__}: {str(e)[:55]}"
-
-    if client is None:
-        try:
-            client = _FastGeminiClient()
-            await client.init(timeout=8, auto_close=False, auto_refresh=False)
-            is_auth = False
-            logger.info("Gemini Web inicializado em modo anonimo (sem cookies).")
-        except Exception as e:
-            logger.error("Falha fatal ao inicializar Gemini anonimo: %s", e)
-            _gemini_init_error = f"Anonimo: {type(e).__name__}: {str(e)[:35]}"
-            raise
-
-    _gemini_client = client
-    _gemini_authenticated = is_auth
-    _gemini_ready = True
+    try:
+        cand = GeminiClient(psid, psidts)
+        await cand.init(timeout=8, auto_close=False, auto_refresh=False)
+        _gemini_client = cand
+        _gemini_ready = True
+        status_val = getattr(cand, "account_status", None)
+        is_avail = (
+            status_val == 1000
+            or getattr(status_val, "value", None) == 1000
+            or getattr(status_val, "name", "") == "AVAILABLE"
+            or getattr(cand, "running", False)
+        )
+        _gemini_authenticated = is_avail
+        _gemini_init_error = None
+        raw_models = cand.list_models() if hasattr(cand, "list_models") else []
+        models_info = [f"{getattr(m, 'display_name', m)}" for m in (raw_models or []) if getattr(m, "is_available", True)]
+        logger.info("Gemini Web inicializado com sucesso! Modelos: %s (status=%s)", models_info, status_val)
+    except Exception as e:
+        _gemini_client = None
+        _gemini_authenticated = False
+        _gemini_ready = False
+        _gemini_init_error = f"{type(e).__name__}: {str(e)[:45]}"
+        logger.warning("Falha ao inicializar Gemini com cookies: %s", e)
 
 
 def warmup_gemini_background():
@@ -657,13 +637,16 @@ def ask_gemini(
             if remaining < 1.0:
                 break
             try:
-                coro = _gemini_client.generate_content(
-                    prompt,
-                    model=model_obj,
-                    chat=chat_session,
-                    temporary=(not should_save_history) if _gemini_authenticated else False,
-                    extended_thinking=extended_thinking,
-                )
+                try:
+                    coro = _gemini_client.generate_content(
+                        prompt,
+                        model=model_obj,
+                        chat=chat_session,
+                        temporary=(not should_save_history) if _gemini_authenticated else False,
+                        extended_thinking=extended_thinking,
+                    )
+                except TypeError:
+                    coro = _gemini_client.generate_content(prompt)
                 fut = asyncio.run_coroutine_threadsafe(coro, loop)
                 resp = fut.result(timeout=remaining)
                 text = (getattr(resp, "text", None) or "").strip()
