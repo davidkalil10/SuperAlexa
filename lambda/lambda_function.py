@@ -3,6 +3,7 @@
 com pesquisa na web, alternancia de provedor por voz e memoria persistente no DynamoDB.
 """
 import asyncio
+import concurrent.futures
 import html
 import json
 import logging
@@ -60,6 +61,18 @@ WEB_SEARCH_MAX_RESULTS = int(os.environ.get("AI_WEB_SEARCH_RESULTS", "5"))
 _cooldown_until = {}
 DEFAULT_COOLDOWN = 60.0
 _last_engine_used = None  # registra exatamente quem gerou a ultima resposta (ex: "Google Gemini" ou "Groq (gpt-oss-120b)")
+
+# Tarefas de pesquisa longa em andamento por usuario: {user_id: {"future": fut, "question": str, "provider": str, "started": float}}
+_pending_tasks = {}
+_executor = None
+PROGRESSIVE_WAIT_SECONDS = 2.2
+HOLD_WAIT_SECONDS = 4.4  # 2.2s + 4.4s = 6.6s (margem segura antes dos 8s da Alexa)
+CONTINUE_PHRASES = (
+    "continuar", "continue", "pode continuar", "pronto", "ok", "pode falar",
+    "diga", "me diga", "fale", "e ai", "terminou", "ja terminou", "ler resposta",
+)
+MSG_PROGRESSIVE = "Só um instante, estou pesquisando..."
+MSG_HOLD = "A pesquisa está bem completa, diga: continuar, para eu ler a resposta!"
 
 SYSTEM_PROMPT = (
     "Você é a Super Alexa, uma assistente de voz inteligente, simpática e direta. "
@@ -507,11 +520,12 @@ def ask_ai(history, user_text, **kwargs):
     """Orquestra a chamada usando o provedor escolhido ('gemini' ou 'groq') com fallback automatico."""
     global _last_engine_used
     provider = kwargs.get("provider") or DEFAULT_PROVIDER
-    deadline = kwargs.get("deadline") or (time.monotonic() + TOTAL_BUDGET_SECONDS)
+    budget = kwargs.get("budget") or 14.0  # permite pesquisas profundas de ate 14s com refresh!
+    deadline = kwargs.get("deadline") or (time.monotonic() + budget)
 
     if provider == "gemini":
         try:
-            gem_timeout = min(GEMINI_BUDGET_SECONDS, max(2.0, deadline - time.monotonic() - 1.4))
+            gem_timeout = max(3.0, deadline - time.monotonic() - 1.5)
             ans = ask_gemini(history, user_text, timeout=gem_timeout)
             _last_engine_used = "Google Gemini"
             return ans
@@ -530,6 +544,48 @@ def ask_ai(history, user_text, **kwargs):
                 except Exception:
                     pass
             raise
+
+
+def _get_executor():
+    global _executor
+    if _executor is None:
+        _executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    return _executor
+
+
+def send_progressive_speech(handler_input, speech_text=MSG_PROGRESSIVE):
+    """Envia fala intermediaria ('Estou pesquisando...') para a Alexa enquanto a IA processa."""
+    try:
+        sys_ctx = handler_input.request_envelope.context.system
+        api_endpoint = getattr(sys_ctx, "api_endpoint", None)
+        api_token = getattr(sys_ctx, "api_access_token", None)
+        req_id = getattr(handler_input.request_envelope.request, "request_id", None)
+        if not (api_endpoint and api_token and req_id):
+            return
+        payload = {
+            "header": {"requestId": req_id},
+            "directive": {"type": "VoicePlayer.Speak", "speech": speech_text},
+        }
+        req = urllib.request.Request(
+            f"{api_endpoint.rstrip('/')}/v1/directives",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=1.2):
+            pass
+    except Exception as e:
+        logger.debug("Progressive response ignorado: %s", e)
+
+
+def is_continue_command(text):
+    norm = _normalize(text)
+    if not norm:
+        return True  # Ex.: "continue {query}" no ChatIntent onde a Alexa engoliu 'continue'
+    return norm in CONTINUE_PHRASES
 
 
 # ----------------------------------------------------------------------------
@@ -604,24 +660,47 @@ def _ask(handler_input, speech, reprompt=MSG_REPROMPT):
     return handler_input.response_builder.speak(speech).ask(reprompt).response
 
 
-def _converse(handler_input, text):
-    """Fluxo principal: processa uma fala do usuario."""
-    text = (text or "").strip()
-    if not text:
-        return _ask(handler_input, "Não entendi. Pode repetir?")
+def _get_user_id(handler_input):
+    try:
+        return handler_input.request_envelope.context.system.user.user_id or "default"
+    except Exception:
+        return "default"
 
+
+def _wait_with_progressive(handler_input, future):
+    """Aguarda a tarefa: em 2.2s manda 'Estou pesquisando...'; espera mais 4.4s (total 6.6s)."""
+    try:
+        return future.result(timeout=PROGRESSIVE_WAIT_SECONDS), True
+    except concurrent.futures.TimeoutError:
+        send_progressive_speech(handler_input, MSG_PROGRESSIVE)
+        try:
+            return future.result(timeout=HOLD_WAIT_SECONDS), True
+        except concurrent.futures.TimeoutError:
+            return None, False
+
+
+def _converse(handler_input, text):
+    """Fluxo principal: processa uma fala do usuario com suporte a refresh de pesquisas longas."""
+    text = (text or "").strip()
+    user_id = _get_user_id(handler_input)
+    pending = _pending_tasks.get(user_id)
+    if not text and not pending:
+        return _ask(handler_input, "Não entendi. Pode repetir?")
     norm = _normalize(text)
     if norm in STOP_WORDS:
+        _pending_tasks.pop(user_id, None)
         return handler_input.response_builder.speak(MSG_BYE).set_should_end_session(True).response
     if norm in HELP_WORDS:
         return _ask(handler_input, MSG_HELP)
     if is_reset_command(text):
+        _pending_tasks.pop(user_id, None)
         clear_history(handler_input)
         return _ask(handler_input, MSG_RESET)
 
     # Troca de provedor por comando de voz ("usar gemini" / "usar groq")
     new_provider = detect_provider_switch(text)
     if new_provider:
+        _pending_tasks.pop(user_id, None)
         save_user_state(handler_input, provider=new_provider)
         if new_provider == "gemini":
             warmup_gemini(max_wait=5.5)
@@ -638,13 +717,51 @@ def _converse(handler_input, text):
             f"O cérebro principal configurado é o {nome}.{detalhe} Para trocar, diga: usar gemini, ou usar groq.",
         )
 
+    # Se havia uma pesquisa longa em andamento e o usuario disse "continuar" (ou similar),
+    # retomamos a tarefa existente ganhando +8 segundos novos da Alexa!
+    if pending and is_continue_command(text):
+        fut = pending["future"]
+        orig_question = pending["question"]
+        try:
+            answer, finished = _wait_with_progressive(handler_input, fut)
+            if not finished:
+                # Ainda processando: pede mais um 'continuar' para ganhar mais 8s
+                return _ask(handler_input, "Ainda estou concluindo a pesquisa, diga: continuar, só mais uma vez!")
+            _pending_tasks.pop(user_id, None)
+        except Exception as e:
+            _pending_tasks.pop(user_id, None)
+            logger.error("Falha ao retomar pesquisa longa: %s", e)
+            return _ask(handler_input, MSG_ERROR)
+
+        history += [
+            {"role": "user", "content": orig_question},
+            {"role": "assistant", "content": answer},
+        ]
+        save_user_state(handler_input, history=history)
+        return _ask(handler_input, clean_for_speech(answer))
+
+    # Nova pergunta: dispara em background com orcamento amplo (14s) e monitora o relogio
+    _pending_tasks.pop(user_id, None)
     context = select_context(history)
+    fut = _get_executor().submit(ask_ai, context, text, provider=provider, budget=14.0)
     try:
-        answer = ask_ai(context, text, provider=provider)
+        answer, finished = _wait_with_progressive(handler_input, fut)
+        if not finished:
+            # Bateu 6.6s e a IA ainda esta pesquisando: guarda a tarefa e faz o refresh com o usuario!
+            _pending_tasks[user_id] = {
+                "future": fut,
+                "question": text,
+                "provider": provider,
+                "started": time.monotonic(),
+            }
+            return _ask(handler_input, MSG_HOLD)
     except AIError as e:
         logger.error("Falha na IA: %s", e)
         msg = MSG_NO_KEY if str(e) == "NO_KEY" else (MSG_TIMEOUT if str(e) == "TIMEOUT" else MSG_ERROR)
         return _ask(handler_input, msg)
+    except Exception as e:
+        logger.error("Falha inesperada na IA: %s", e)
+        return _ask(handler_input, MSG_ERROR)
 
     history += [
         {"role": "user", "content": text},
