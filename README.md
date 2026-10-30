@@ -1,16 +1,19 @@
 # Super Alexa
 
-Skill customizada da Alexa que conversa com uma IA (**Groq**, API compatível com OpenAI) por voz, com **memória persistente** (DynamoDB) e comando para **limpar a memória**.
+Skill customizada da Alexa que conversa com **Google Gemini Web (`HanaokaYuzu/Gemini-API`)** ou **Groq** por voz, com **pesquisa na web integrada**, **alternância de IA por comando de voz** e **memória persistente** (DynamoDB).
 
 ```
-Voz -> Alexa (ASR) -> Lambda -> Groq -> texto -> Alexa (TTS) -> voz
+Voz -> Alexa (ASR) -> Lambda -> Gemini Web (Google Search nativo) OU Groq (+ DuckDuckGo) -> Alexa (TTS) -> Voz
 ```
 
 ## Como usar
-- Abrir: **"Alexa, abrir modo super"** (invocação: `modo super`; "Alexa" não é permitido no nome de invocação).
-- Conversar: você pode falar naturalmente ou começar com frases como *"me explique..."*, *"quero saber..."*, *"o que é..."*, *"sobre..."*, *"e..."*. O modelo possui tanto frases-gatilho quanto um modo pega-tudo (`CatchAllIntent`) que envia falas curtas ou soltas direto ao LLM.
-- Pesquisar na web: diga **"pesquise na internet sobre..."** ou faça perguntas sobre fatos de hoje/notícias. Se o modelo não souber algo na resposta rápida, ele também tenta pesquisar automaticamente se houver tempo.
-- A skill mantém o microfone aberto após cada resposta; fica em silêncio ~8s e a sessão fecha, mas o histórico continua salvo.
+- Abrir: **"Alexa, abrir modo super"** (no momento em que a skill abre, o cliente do Gemini já é aquecido automaticamente em segundo plano).
+- Conversar: fale naturalmente ou comece com frases como *"me explique..."*, *"quero saber..."*, *"o que é..."*, *"sobre..."*, *"é um..."*, *"e..."*, ou palavras curtas como *"Ronin"*.
+- **Alternar entre Gemini e Groq por voz:**
+  - **"usar gemini"** / **"mudar para gemini"** (usa o Google Gemini com pesquisa Google nativa; funciona direto em modo anônimo sem precisar de chave ou cookies!).
+  - **"usar groq"** / **"mudar para groq"** (usa a cascata ultra-rápida do Groq + pesquisa DuckDuckGo).
+  - **"qual inteligência artificial"** / **"qual modelo"** (informa qual cérebro está ativo no momento).
+  - *Nota:* Se o Gemini estiver ativo e demorar mais de ~5,8s (ou se ainda estiver aquecendo), a skill faz **fallback automático** para o Groq na mesma chamada para nunca estourar o limite de 8s da Alexa!
 - Limpar memória: **"nova conversa"**, **"limpar memória"**, **"apagar histórico"**, **"esquecer tudo"**, **"zerar memória"**.
 - Sair: **"parar"**.
 

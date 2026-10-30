@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Super Alexa - Custom Skill que conversa com uma IA (Groq, API compativel com OpenAI),
-enriquecida automaticamente com busca na web (DuckDuckGo Lite) e memoria no DynamoDB.
-
-Fluxo: Alexa (voz->texto) -> este Lambda (busca web + Groq) -> texto -> Alexa (texto->voz).
+"""Super Alexa - Custom Skill que conversa com IA (Gemini Web Anonimo/Autenticado ou Groq),
+com pesquisa na web, alternancia de provedor por voz e memoria persistente no DynamoDB.
 """
+import asyncio
 import html
 import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -29,6 +29,7 @@ logger.setLevel(logging.INFO)
 # ----------------------------------------------------------------------------
 # Configuracao
 # ----------------------------------------------------------------------------
+DEFAULT_PROVIDER = os.environ.get("AI_DEFAULT_PROVIDER", "gemini").strip().lower()  # "gemini" ou "groq"
 BASE_URL = os.environ.get("AI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 DEFAULT_MODELS = [
     "openai/gpt-oss-120b",
@@ -46,9 +47,10 @@ CONTEXT_CHAR_BUDGET = int(os.environ.get("CONTEXT_CHAR_BUDGET", "12000"))
 MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "500"))
 # A Alexa derruba a resposta apos ~8s; deixamos margem.
 TOTAL_BUDGET_SECONDS = float(os.environ.get("AI_TOTAL_BUDGET", "7.2"))
+GEMINI_BUDGET_SECONDS = float(os.environ.get("GEMINI_BUDGET", "5.8"))
 MAX_SPEECH_CHARS = 1500
 
-# Busca web automatica por baixo dos panos (DuckDuckGo Lite, ~0.4s, zero gasto de cota da IA).
+# Busca web automatica por baixo dos panos para o Groq (DuckDuckGo Lite, ~0.4s).
 WEB_SEARCH_ENABLED = os.environ.get("AI_SEARCH_ENABLED", "1") != "0"
 WEB_SEARCH_TIMEOUT = float(os.environ.get("AI_WEB_SEARCH_TIMEOUT", "2.2"))
 WEB_SEARCH_MAX_RESULTS = int(os.environ.get("AI_WEB_SEARCH_RESULTS", "5"))
@@ -60,18 +62,18 @@ DEFAULT_COOLDOWN = 60.0
 SYSTEM_PROMPT = (
     "Voce e a Super Alexa, uma assistente de voz inteligente, simpatica e direta. "
     "Responda sempre em portugues do Brasil, de forma curta e natural para ser falada em voz alta "
-    "(no maximo 3 ou 4 frases, a menos que o usuario peca mais detalhes). "
+    "(no maximo 2 ou 3 frases curtas, a menos que o usuario peca mais detalhes). "
     "NAO use markdown, listas com marcadores, asteriscos, emojis, tabelas ou links. "
     "Se precisar enumerar, use frases corridas. Use o historico da conversa para manter o contexto. "
     "IMPORTANTE SOBRE FRASES CORTADAS E CONTINUACOES: A Alexa as vezes remove a primeira palavra da frase "
     "do usuario (como 'é um', 'pesquise', 'quero saber', 'sobre', 'como') ou o usuario responde com uma "
-    "palavra solta ou complemento curto (ex: 'Ronin', 'um jogo j2me', 'e ele?'). Sempre reconstrua o sentido "
-    "naturalmente combinando com o assunto da conversa anterior! "
-    "IMPORTANTE SOBRE PESQUISA NA WEB: Junto com a fala do usuario, voce recebera trechos de pesquisa na web "
-    "atualizados entre colchetes. Use esses dados para responder sobre fatos recentes, eleicoes, noticias, "
-    "pessoas, empresas ou jogos especificos com precisao, como se voce mesma tivesse pesquisado. "
-    "Se os resultados da web nao tiverem nada util sobre uma pessoa ou assunto muito especifico e voce nao "
-    "tiver certeza absoluta, diga com honestidade que nao encontrou informacao confiavel e peca mais detalhes. "
+    "palavra solta ou complemento curto (ex: 'Ronin', 'um jogo j2me', 'e ele?'). Se a fala atual tiver relacao "
+    "com o assunto anterior, reconstrua o sentido combinando com o historico; mas se for uma pergunta sobre "
+    "uma nova pessoa ou novo assunto sem relacao com o anterior, trate como um assunto novo do zero e NAO "
+    "misture com o tema antigo! "
+    "IMPORTANTE SOBRE PESQUISA NA WEB: Use os dados de pesquisa na web fornecidos (ou sua busca Google nativa) "
+    "para responder sobre fatos recentes, eleicoes, noticias, pessoas, empresas ou jogos especificos com precisao. "
+    "NUNCA invente fatos. Se nao encontrar informacao confiavel, diga isso com honestidade e peca mais detalhes. "
     "Voce NAO controla dispositivos, musicas, alarmes ou casa inteligente; se pedirem isso, "
     "explique gentilmente que nesta skill voce so conversa."
 )
@@ -89,13 +91,32 @@ RESET_PHRASES = (
     "comecar de novo",
 )
 
+SWITCH_TO_GEMINI = (
+    "usar gemini", "usar o gemini", "mudar para gemini", "mudar para o gemini",
+    "trocar para gemini", "trocar para o gemini", "ativar gemini", "ativar o gemini",
+    "modo gemini", "ligar gemini",
+)
+SWITCH_TO_GROQ = (
+    "usar groq", "usar o groq", "mudar para groq", "mudar para o groq",
+    "trocar para groq", "trocar para o groq", "ativar groq", "ativar o groq",
+    "modo groq", "ligar groq",
+    # variacoes comuns de transcricao da Alexa para "groq"
+    "usar grok", "usar o grok", "mudar para grok", "trocar para grok", "ativar grok", "modo grok",
+    "usar brock", "mudar para brock", "usar glock", "mudar para glock",
+)
+STATUS_PHRASES = (
+    "qual inteligencia artificial", "qual ia", "qual modelo", "qual provedor",
+    "qual inteligencia voce esta usando", "qual modelo voce esta usando", "quem e voce",
+)
+
 MSG_WELCOME = "Modo super ativado! Pode falar, sobre o que vamos conversar?"
 STOP_WORDS = {"parar", "para", "pare", "sair", "tchau", "cancelar", "cancela", "encerrar", "ate logo", "chega", "fechar"}
 HELP_WORDS = {"ajuda", "me ajuda", "socorro"}
 MSG_REPROMPT = "Pode continuar, estou ouvindo."
 MSG_HELP = (
-    "Eu sou uma assistente com inteligencia artificial e acesso a pesquisa na web. Faca qualquer pergunta "
-    "e continue a conversa normalmente. Para apagar minha memoria, diga: nova conversa. Para sair, diga: parar."
+    "Eu sou uma assistente com inteligencia artificial e pesquisa na web. Faca qualquer pergunta "
+    "e continue a conversa normalmente. Voce pode dizer: usar gemini, ou usar groq, para escolher o cerebro. "
+    "Para apagar minha memoria, diga: nova conversa. Para sair, diga: parar."
 )
 MSG_RESET = "Pronto, apaguei a memoria. Vamos comecar uma nova conversa!"
 MSG_BYE = "Ate logo!"
@@ -104,17 +125,125 @@ MSG_TIMEOUT = "Desculpe, a resposta demorou demais. Pode perguntar de novo?"
 MSG_NO_KEY = "A chave da inteligencia artificial nao esta configurada. Verifique a configuracao da skill."
 
 
+def _load_secrets():
+    path = os.path.join(os.path.dirname(__file__), "secrets.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
 def _load_api_key():
     key = os.environ.get("GROQ_API_KEY") or os.environ.get("AI_API_KEY")
     if key:
         return key.strip()
-    path = os.path.join(os.path.dirname(__file__), "secrets.json")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return (data.get("GROQ_API_KEY") or data.get("AI_API_KEY") or "").strip() or None
-    except (OSError, ValueError):
-        return None
+    data = _load_secrets()
+    return (data.get("GROQ_API_KEY") or data.get("AI_API_KEY") or "").strip() or None
+
+
+def _load_gemini_cookies():
+    psid = os.environ.get("GEMINI_1PSID")
+    psidts = os.environ.get("GEMINI_1PSIDTS")
+    if not psid:
+        data = _load_secrets()
+        psid = data.get("GEMINI_1PSID") or data.get("Secure_1PSID")
+        psidts = data.get("GEMINI_1PSIDTS") or data.get("Secure_1PSIDTS")
+    return (psid.strip() if psid else None), (psidts.strip() if psidts else None)
+
+
+# ----------------------------------------------------------------------------
+# Cliente Gemini Web (HanaokaYuzu/Gemini-API) com aquecimento em background
+# ----------------------------------------------------------------------------
+_gemini_loop = None
+_gemini_client = None
+_gemini_ready = False
+_gemini_lock = threading.Lock()
+
+
+def _ensure_gemini_loop():
+    global _gemini_loop
+    if _gemini_loop is None:
+        _gemini_loop = asyncio.new_event_loop()
+        t = threading.Thread(target=_gemini_loop.run_forever, daemon=True)
+        t.start()
+    return _gemini_loop
+
+
+async def _init_gemini_async():
+    global _gemini_client, _gemini_ready
+    from gemini_webapi import GeminiClient
+
+    psid, psidts = _load_gemini_cookies()
+    client = GeminiClient(psid, psidts) if psid else GeminiClient()
+    await client.init(timeout=15, auto_close=False, auto_refresh=bool(psid))
+    _gemini_client = client
+    _gemini_ready = True
+    logger.info("Gemini Web inicializado com sucesso (autenticado=%s).", bool(psid))
+
+
+def warmup_gemini_background():
+    """Dispara a inicializacao do Gemini em segundo plano (ex: no LaunchRequest)."""
+    if _gemini_ready:
+        return
+
+    def _runner():
+        with _gemini_lock:
+            if _gemini_ready:
+                return
+            try:
+                loop = _ensure_gemini_loop()
+                fut = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
+                fut.result(timeout=16)
+            except Exception as e:
+                logger.warning("Aquecimento do Gemini falhou: %s", e)
+
+    threading.Thread(target=_runner, daemon=True).start()
+
+
+def build_gemini_prompt(history, user_text):
+    ctx = ""
+    if history:
+        lines = []
+        for m in history[-8:]:
+            role = "Usuario" if m.get("role") == "user" else "Assistente"
+            lines.append(f"{role}: {m.get('content', '')}")
+        ctx = "Historico recente da conversa:\n" + "\n".join(lines) + "\n\n"
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"{ctx}"
+        f"Nova fala do usuario (pode ter tido a primeira palavra cortada pela Alexa): {user_text}\n\n"
+        "Responda agora em portugues do Brasil em no maximo 2 ou 3 frases curtas para voz, sem markdown:"
+    )
+
+
+def ask_gemini(history, user_text, timeout=GEMINI_BUDGET_SECONDS):
+    """Chama o Gemini Web (anonimo ou autenticado) dentro do tempo limite."""
+    t0 = time.monotonic()
+    loop = _ensure_gemini_loop()
+    if not _gemini_ready:
+        # Se nao estiver aquecido, so tenta inicializar se houver tempo suficiente
+        if timeout < 5.0:
+            raise AIError("GEMINI_NOT_WARMED")
+        with _gemini_lock:
+            if not _gemini_ready:
+                fut_init = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
+                fut_init.result(timeout=max(1.0, timeout - 2.5))
+
+    remaining = timeout - (time.monotonic() - t0)
+    if remaining < 1.2:
+        raise AIError("TIMEOUT")
+
+    prompt = build_gemini_prompt(history, user_text)
+    fut = asyncio.run_coroutine_threadsafe(_gemini_client.generate_content(prompt), loop)
+    resp = fut.result(timeout=remaining)
+    text = (getattr(resp, "text", None) or "").strip()
+    # Remove tags internas de cards do Google (ex: <ElectionCardsGroup>...</ElectionCardsGroup>)
+    text = re.sub(r"<[A-Za-z]+[^>]*>.*?</[A-Za-z]+>", "", text, flags=re.S)
+    text = re.sub(r"<[A-Za-z]+[^>]*/>", "", text).strip()
+    if not text:
+        raise AIError("resposta vazia do Gemini")
+    return text
 
 
 # ----------------------------------------------------------------------------
@@ -136,9 +265,25 @@ def is_reset_command(text):
     return any(norm == p or norm.endswith(p) for p in RESET_PHRASES)
 
 
+def detect_provider_switch(text):
+    norm = _normalize(text)
+    if any(norm == p or norm.endswith(p) for p in SWITCH_TO_GEMINI):
+        return "gemini"
+    if any(norm == p or norm.endswith(p) for p in SWITCH_TO_GROQ):
+        return "groq"
+    return None
+
+
+def is_status_command(text):
+    norm = _normalize(text)
+    return any(norm == p or norm.endswith(p) for p in STATUS_PHRASES)
+
+
 def clean_for_speech(text):
-    """Remove markdown/emojis/citacoes e escapa para SSML."""
+    """Remove markdown/emojis/citacoes/tags e escapa para SSML."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    text = re.sub(r"<[A-Za-z]+[^>]*>.*?</[A-Za-z]+>", "", text, flags=re.S)
+    text = re.sub(r"<[A-Za-z]+[^>]*/>", "", text)
     text = re.sub(r"\u3010[^\u3011]*\u3011", "", text)
     text = re.sub(r"\[?\d+†[^\s\]]+\]?", "", text)
     text = re.sub(r"\[\d+\]", "", text)
@@ -156,7 +301,7 @@ def clean_for_speech(text):
 
 
 # ----------------------------------------------------------------------------
-# Pesquisa na Web Automatica (DuckDuckGo Lite - rapida e gratuita)
+# Pesquisa na Web Automatica para o Groq (DuckDuckGo Lite)
 # ----------------------------------------------------------------------------
 STRIP_SEARCH_WORDS = (
     "pesquise na internet sobre ", "pesquise na internet ", "pesquise na web sobre ", "pesquise na web ",
@@ -179,7 +324,6 @@ def build_search_query(history, user_text):
         return t
 
     q = _clean(user_text)
-    # Se a fala atual for curta (ate 6 palavras) e houver conversa anterior, junta com os ultimos 2 topicos do usuario
     if len(q.split()) <= 6 and history:
         prev_users = [_clean(m.get("content", "")) for m in history if m.get("role") == "user"]
         if prev_users:
@@ -221,7 +365,7 @@ def fetch_web_snippets(query, timeout=WEB_SEARCH_TIMEOUT, max_results=WEB_SEARCH
 
 
 # ----------------------------------------------------------------------------
-# Cliente da IA (OpenAI-compatible)
+# Cliente da IA (Groq + Orquestrador Gemini/Groq)
 # ----------------------------------------------------------------------------
 class AIError(Exception):
     pass
@@ -257,7 +401,6 @@ def _in_cooldown(model):
 
 
 def _start_cooldown(model, http_error):
-    """429: marca o modelo como indisponivel por um tempo (respeita Retry-After, max 5 min)."""
     wait = DEFAULT_COOLDOWN
     try:
         wait = min(float(http_error.headers.get("retry-after", DEFAULT_COOLDOWN)), 300.0)
@@ -267,19 +410,20 @@ def _start_cooldown(model, http_error):
     logger.warning("Modelo %s em cooldown por %.0fs (429)", model, wait)
 
 
-def ask_ai(history, user_text, **kwargs):
-    """Enriquece a pergunta com pesquisa na web por baixo dos panos e chama a cascata do Groq."""
+def ask_groq(history, user_text, deadline=None):
+    """Enriquece a pergunta com pesquisa DuckDuckGo e chama a cascata do Groq."""
     api_key = _load_api_key()
     if not api_key:
         raise AIError("NO_KEY")
 
-    deadline = kwargs.get("deadline") or (time.monotonic() + TOTAL_BUDGET_SECONDS)
+    deadline = deadline or (time.monotonic() + TOTAL_BUDGET_SECONDS)
 
-    # Fazemos a pesquisa rapida na web por baixo dos panos em toda pergunta
     search_query = build_search_query(history, user_text)
     web_snippets = ""
-    if WEB_SEARCH_ENABLED and (deadline - time.monotonic()) > 3.5:
-        web_snippets = fetch_web_snippets(search_query, timeout=min(WEB_SEARCH_TIMEOUT, deadline - time.monotonic() - 2.0))
+    if WEB_SEARCH_ENABLED and (deadline - time.monotonic()) > 2.8:
+        web_snippets = fetch_web_snippets(
+            search_query, timeout=min(WEB_SEARCH_TIMEOUT, deadline - time.monotonic() - 1.5)
+        )
 
     augmented_user = user_text
     if web_snippets:
@@ -292,14 +436,13 @@ def ask_ai(history, user_text, **kwargs):
         {"role": "user", "content": augmented_user}
     ]
 
-    # Modelos fora de cooldown primeiro; em cooldown no fim como ultimo recurso.
     candidates = [m for m in MODELS if not _in_cooldown(m)] + [m for m in MODELS if _in_cooldown(m)]
 
     last_err = None
     timed_out = False
     for model in candidates:
         remaining = deadline - time.monotonic()
-        if remaining < 0.8:
+        if remaining < 0.7:
             break
         try:
             return _post_chat(model, messages, api_key, timeout=min(remaining, 5.5))
@@ -318,12 +461,42 @@ def ask_ai(history, user_text, **kwargs):
     raise AIError("TIMEOUT" if timed_out else f"FAILED: {last_err}")
 
 
+def ask_ai(history, user_text, **kwargs):
+    """Orquestra a chamada usando o provedor escolhido ('gemini' ou 'groq') com fallback automatico."""
+    provider = kwargs.get("provider") or DEFAULT_PROVIDER
+    deadline = kwargs.get("deadline") or (time.monotonic() + TOTAL_BUDGET_SECONDS)
+
+    if provider == "gemini":
+        try:
+            # Tenta o Gemini (ja aquecido no LaunchRequest); se demorar mais de ~5.5s ou falhar,
+            # cai automaticamente para o Groq nos ~1.7s restantes para a Alexa nunca dar timeout!
+            gem_timeout = min(GEMINI_BUDGET_SECONDS, max(1.5, deadline - time.monotonic() - 1.5))
+            return ask_gemini(history, user_text, timeout=gem_timeout)
+        except Exception as e:
+            logger.warning("Gemini falhou/demorou (%s); fazendo fallback automatico para Groq.", e)
+            # Inicia aquecimento em background caso ainda nao estivesse pronto
+            warmup_gemini_background()
+            return ask_groq(history, user_text, deadline=deadline)
+    else:
+        try:
+            return ask_groq(history, user_text, deadline=deadline)
+        except AIError as e:
+            if str(e) != "NO_KEY" and (deadline - time.monotonic()) > 3.5:
+                try:
+                    return ask_gemini(history, user_text, timeout=deadline - time.monotonic())
+                except Exception:
+                    pass
+            raise
+
+
 # ----------------------------------------------------------------------------
-# Memoria (DynamoDB)
+# Memoria e Preferencias no DynamoDB
 # ----------------------------------------------------------------------------
-def get_history(handler_input):
+def get_user_state(handler_input):
     attrs = handler_input.attributes_manager.persistent_attributes
-    return list(attrs.get("history", []))
+    history = list(attrs.get("history", []))
+    provider = attrs.get("provider") or DEFAULT_PROVIDER
+    return history, provider
 
 
 def _size(messages):
@@ -331,7 +504,6 @@ def _size(messages):
 
 
 def trim_for_storage(history):
-    """Descarta as mensagens mais antigas somente se passar do teto de bytes."""
     if _size(history) <= MAX_STORED_BYTES:
         return history
     total, keep_from = 2, len(history)
@@ -347,7 +519,6 @@ def trim_for_storage(history):
 
 
 def select_context(history):
-    """Pega as mensagens mais recentes que cabem no orcamento de caracteres enviado a IA."""
     chosen, total = [], 0
     for msg in reversed(history):
         total += len(msg.get("content", ""))
@@ -360,16 +531,27 @@ def select_context(history):
     return chosen
 
 
-def save_history(handler_input, history):
+def save_user_state(handler_input, history=None, provider=None):
     mgr = handler_input.attributes_manager
     attrs = mgr.persistent_attributes
-    attrs["history"] = trim_for_storage(history)
+    if history is not None:
+        attrs["history"] = trim_for_storage(history)
+    if provider is not None:
+        attrs["provider"] = provider
     mgr.persistent_attributes = attrs
     mgr.save_persistent_attributes()
 
 
+def get_history(handler_input):
+    return get_user_state(handler_input)[0]
+
+
+def save_history(handler_input, history):
+    save_user_state(handler_input, history=history)
+
+
 def clear_history(handler_input):
-    save_history(handler_input, [])
+    save_user_state(handler_input, history=[])
 
 
 # ----------------------------------------------------------------------------
@@ -394,10 +576,27 @@ def _converse(handler_input, text):
         clear_history(handler_input)
         return _ask(handler_input, MSG_RESET)
 
-    history = get_history(handler_input)
+    # Troca de provedor por comando de voz ("usar gemini" / "usar groq")
+    new_provider = detect_provider_switch(text)
+    if new_provider:
+        save_user_state(handler_input, provider=new_provider)
+        if new_provider == "gemini":
+            warmup_gemini_background()
+            return _ask(handler_input, "Pronto! Mudei o cerebro principal para o Google Gemini. Pode perguntar!")
+        return _ask(handler_input, "Pronto! Mudei o cerebro principal para o Groq. Pode perguntar!")
+
+    history, provider = get_user_state(handler_input)
+
+    if is_status_command(text):
+        nome = "Google Gemini" if provider == "gemini" else "Groq"
+        return _ask(
+            handler_input,
+            f"No momento estou usando o {nome} como cerebro principal. Para trocar, basta dizer: usar gemini, ou usar groq.",
+        )
+
     context = select_context(history)
     try:
-        answer = ask_ai(context, text)
+        answer = ask_ai(context, text, provider=provider)
     except AIError as e:
         logger.error("Falha na IA: %s", e)
         msg = MSG_NO_KEY if str(e) == "NO_KEY" else (MSG_TIMEOUT if str(e) == "TIMEOUT" else MSG_ERROR)
@@ -407,7 +606,7 @@ def _converse(handler_input, text):
         {"role": "user", "content": text},
         {"role": "assistant", "content": answer},
     ]
-    save_history(handler_input, history)
+    save_user_state(handler_input, history=history)
     return _ask(handler_input, clean_for_speech(answer))
 
 
@@ -416,7 +615,23 @@ class LaunchRequestHandler(AbstractRequestHandler):
         return ask_utils.is_request_type("LaunchRequest")(handler_input)
 
     def handle(self, handler_input):
+        # Ja aquece o cliente do Gemini em segundo plano assim que a skill abre!
+        warmup_gemini_background()
         return _ask(handler_input, MSG_WELCOME)
+
+
+class SwitchProviderIntentHandler(AbstractRequestHandler):
+    def can_handle(self, handler_input):
+        return ask_utils.is_intent_name("SwitchProviderIntent")(handler_input)
+
+    def handle(self, handler_input):
+        prov = _normalize(ask_utils.get_slot_value(handler_input, "provider") or "")
+        target = "gemini" if "gemini" in prov else "groq"
+        save_user_state(handler_input, provider=target)
+        if target == "gemini":
+            warmup_gemini_background()
+            return _ask(handler_input, "Pronto! Mudei o cerebro principal para o Google Gemini. Pode perguntar!")
+        return _ask(handler_input, "Pronto! Mudei o cerebro principal para o Groq. Pode perguntar!")
 
 
 class ChatIntentHandler(AbstractRequestHandler):
@@ -429,8 +644,6 @@ class ChatIntentHandler(AbstractRequestHandler):
 
 
 class CatchAllIntentHandler(AbstractRequestHandler):
-    """Pega qualquer fala livre e a repassa ao LLM (ele entende o contexto sozinho)."""
-
     def can_handle(self, handler_input):
         return ask_utils.is_intent_name("CatchAllIntent")(handler_input)
 
@@ -517,6 +730,7 @@ sb = CustomSkillBuilder(persistence_adapter=_build_persistence_adapter())
 
 sb.add_request_handler(LaunchRequestHandler())
 sb.add_request_handler(ResetHistoryIntentHandler())
+sb.add_request_handler(SwitchProviderIntentHandler())
 sb.add_request_handler(ChatIntentHandler())
 sb.add_request_handler(CatchAllIntentHandler())
 sb.add_request_handler(HelpIntentHandler())

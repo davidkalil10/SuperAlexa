@@ -45,6 +45,27 @@
           ]
         },
         {
+          "name": "SwitchProviderIntent",
+          "slots": [
+            {
+              "name": "provider",
+              "type": "AI_PROVIDER"
+            }
+          ],
+          "samples": [
+            "usar {provider}",
+            "usar o {provider}",
+            "mudar para {provider}",
+            "mudar para o {provider}",
+            "trocar para {provider}",
+            "trocar para o {provider}",
+            "ativar {provider}",
+            "ativar o {provider}",
+            "modo {provider}",
+            "ligar {provider}"
+          ]
+        },
+        {
           "name": "ChatIntent",
           "slots": [
             {
@@ -540,6 +561,30 @@
             {
               "name": {
                 "value": "explique melhor essa última parte por favor"
+              }
+            }
+          ]
+        },
+        {
+          "name": "AI_PROVIDER",
+          "values": [
+            {
+              "name": {
+                "value": "gemini",
+                "synonyms": [
+                  "google gemini",
+                  "google"
+                ]
+              }
+            },
+            {
+              "name": {
+                "value": "groq",
+                "synonyms": [
+                  "grok",
+                  "brock",
+                  "glock"
+                ]
               }
             }
           ]
