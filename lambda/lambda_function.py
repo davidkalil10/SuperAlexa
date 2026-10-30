@@ -8,6 +8,22 @@ import sys
 # Injeta 'from __future__ import annotations' no gemini_webapi no Python < 3.10
 # para permitir type hints com '|' (PEP 604) sem TypeError em tempo de execucao.
 if sys.version_info < (3, 10):
+    # Backports da biblioteca padrao para Python 3.8 / 3.9
+    import datetime
+    if not hasattr(datetime, "UTC"):
+        datetime.UTC = datetime.timezone.utc
+
+    import functools
+    if not hasattr(functools, "cache"):
+        functools.cache = functools.lru_cache(maxsize=None)
+
+    import enum
+    if not hasattr(enum, "StrEnum"):
+        class StrEnum(str, enum.Enum):
+            def __str__(self):
+                return str(self.value)
+        enum.StrEnum = StrEnum
+
     try:
         from importlib.machinery import SourceFileLoader
 
@@ -425,13 +441,19 @@ async def _init_gemini_async():
 
     _gemini_init_error = None
     from gemini_webapi import GeminiClient
-    from gemini_webapi.constants import AccountStatus
+    try:
+        from gemini_webapi.constants import AccountStatus
+    except Exception:
+        class AccountStatus:
+            AVAILABLE = 1000
+            UNAUTHENTICATED = 1016
 
     class _FastGeminiClient(GeminiClient):
         """Otimiza o init() executando apenas _fetch_user_status (descobre modelos da conta em ~0.3s)."""
 
         async def _init_rpc(self) -> None:
-            await self._fetch_user_status()
+            if hasattr(self, "_fetch_user_status"):
+                await self._fetch_user_status()
 
         async def _sync_activity(self) -> None:
             self.last_activity_time = time.time()
@@ -444,21 +466,30 @@ async def _init_gemini_async():
         try:
             cand = _FastGeminiClient(psid, psidts)
             await cand.init(timeout=8, auto_close=False, auto_refresh=False)
-            if getattr(cand, "account_status", None) == AccountStatus.AVAILABLE:
+            status_val = getattr(cand, "account_status", None)
+            is_avail = (
+                status_val == 1000
+                or getattr(status_val, "value", None) == 1000
+                or getattr(status_val, "name", "") == "AVAILABLE"
+                or (AccountStatus is not None and status_val == getattr(AccountStatus, "AVAILABLE", 1000))
+                or getattr(cand, "running", False)
+            )
+            if is_avail:
                 client = cand
                 is_auth = True
-                models_info = [f"{m.display_name} ({m.model_name})" for m in (cand.list_models() or []) if m.is_available]
+                raw_models = cand.list_models() if hasattr(cand, "list_models") else []
+                models_info = [f"{getattr(m, 'display_name', m)} ({getattr(m, 'model_name', m)})" for m in (raw_models or []) if getattr(m, "is_available", True)]
                 logger.info("Gemini Web autenticado na conta com sucesso! Modelos disponiveis: %s", models_info)
             else:
                 logger.warning(
                     "Cookies do Gemini nao autenticaram (status=%s); usando sessao como anonima.",
-                    getattr(cand, "account_status", None),
+                    status_val,
                 )
                 client = cand
                 is_auth = False
         except Exception as e:
             logger.warning("Falha ao inicializar Gemini com cookies (%s); criando sessao anonima.", e)
-            _gemini_init_error = f"{type(e).__name__}: {str(e)[:35]}"
+            _gemini_init_error = f"{type(e).__name__}: {str(e)[:55]}"
 
     if client is None:
         try:
@@ -511,7 +542,8 @@ def warmup_gemini(max_wait=7.0):
 
 def _select_gemini_candidates(client, preferred_model=""):
     """Retorna a lista ordenada de modelos disponiveis na conta, priorizando o 3.8 Flash."""
-    avail = [m for m in (client.list_models() or []) if getattr(m, "is_available", True)]
+    raw_models = client.list_models() if hasattr(client, "list_models") else []
+    avail = [m for m in (raw_models or []) if getattr(m, "is_available", True)]
     if not _gemini_authenticated:
         if avail:
             m0 = avail[0]
