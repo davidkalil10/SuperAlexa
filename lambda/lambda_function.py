@@ -70,8 +70,9 @@ _last_topic_by_user = {}  # guarda o ultimo assunto pesquisado mesmo se um turno
 _pending_tasks = {}
 _executor = None
 _request_start_time = 0.0
+_lambda_context = None
 PROGRESSIVE_WAIT_SECONDS = 2.0
-MAX_LAMBDA_SAFE_SECONDS = 5.6  # margem segura para NUNCA estourar os 8s do container AWS Lambda (mesmo em cold start)
+MAX_LAMBDA_SAFE_SECONDS = 5.2  # margem segura para NUNCA estourar os 8s do container AWS Lambda (mesmo em cold start)
 CONTINUE_PHRASES = (
     "continuar", "continue", "pode continuar", "pronto", "ok", "pode falar",
     "diga", "me diga", "fale", "e ai", "terminou", "ja terminou", "ler resposta",
@@ -143,6 +144,10 @@ STATUS_PHRASES = (
 )
 
 MSG_WELCOME = "Modo super ativado! Pode falar, sobre o que vamos conversar?"
+LAUNCH_PHRASES = {
+    "modo super", "abrir modo super", "abra modo super", "abra o modo super",
+    "iniciar modo super", "ativar modo super", "comecar modo super", "super alexa",
+}
 STOP_WORDS = {
     "parar", "para", "pare", "sair", "tchau", "cancelar", "cancela",
     "encerrar", "encerra", "terminar", "termina", "ate logo", "chega", "fechar", "basta",
@@ -697,8 +702,9 @@ def ask_ai(history, user_text, **kwargs):
     deadline = kwargs.get("deadline") or (time.monotonic() + budget)
     fallback_topic = kwargs.get("fallback_topic") or ""
 
-    # Dispara o aquecimento do Gemini em paralelo com a busca DuckDuckGo (container ativo, sem congelar socket!)
-    warmup_gemini_background()
+    # Se o provedor for Gemini, dispara o aquecimento em paralelo com a busca DuckDuckGo
+    if provider == "gemini":
+        warmup_gemini_background()
 
     search_query = build_search_query(history, user_text, fallback_topic=fallback_topic)
     web_snippets = ""
@@ -808,10 +814,14 @@ def is_continue_command(text):
 # Memoria e Preferencias no DynamoDB
 # ----------------------------------------------------------------------------
 def get_user_state(handler_input):
-    attrs = handler_input.attributes_manager.persistent_attributes
-    history = list(attrs.get("history", []))
-    provider = attrs.get("provider") or DEFAULT_PROVIDER
-    return history, provider
+    try:
+        attrs = handler_input.attributes_manager.persistent_attributes
+        history = list(attrs.get("history", []))
+        provider = attrs.get("provider") or DEFAULT_PROVIDER
+        return history, provider
+    except Exception as e:
+        logger.warning("Falha ao ler DynamoDB (usando estado padrao): %s", e)
+        return [], DEFAULT_PROVIDER
 
 
 def _size(messages):
@@ -848,14 +858,17 @@ def select_context(history):
 
 
 def save_user_state(handler_input, history=None, provider=None):
-    mgr = handler_input.attributes_manager
-    attrs = mgr.persistent_attributes
-    if history is not None:
-        attrs["history"] = trim_for_storage(history)
-    if provider is not None:
-        attrs["provider"] = provider
-    mgr.persistent_attributes = attrs
-    mgr.save_persistent_attributes()
+    try:
+        mgr = handler_input.attributes_manager
+        attrs = mgr.persistent_attributes
+        if history is not None:
+            attrs["history"] = trim_for_storage(history)
+        if provider is not None:
+            attrs["provider"] = provider
+        mgr.persistent_attributes = attrs
+        mgr.save_persistent_attributes()
+    except Exception as e:
+        logger.warning("Falha ao salvar estado no DynamoDB: %s", e)
 
 
 def get_history(handler_input):
@@ -884,16 +897,29 @@ def _get_user_id(handler_input):
         return "default"
 
 
-def _wait_with_progressive(handler_input, future, req_start):
-    """Aguarda a tarefa respeitando o tempo total do Lambda (MAX_LAMBDA_SAFE_SECONDS)."""
+def _remaining_lambda_seconds(req_start):
+    """Calcula o tempo restante real do container AWS Lambda descontando 1.5s de margem de seguranca."""
     elapsed = time.monotonic() - req_start
-    wait1 = max(0.2, min(PROGRESSIVE_WAIT_SECONDS, MAX_LAMBDA_SAFE_SECONDS - elapsed - 0.5))
+    soft_rem = MAX_LAMBDA_SAFE_SECONDS - elapsed
+    if _lambda_context is not None and hasattr(_lambda_context, "get_remaining_time_in_millis"):
+        try:
+            hw_rem = (_lambda_context.get_remaining_time_in_millis() / 1000.0) - 1.5
+            return min(soft_rem, hw_rem)
+        except Exception:
+            pass
+    return soft_rem
+
+
+def _wait_with_progressive(handler_input, future, req_start):
+    """Aguarda a tarefa respeitando o tempo restante real do AWS Lambda."""
+    rem1 = _remaining_lambda_seconds(req_start)
+    wait1 = max(0.2, min(PROGRESSIVE_WAIT_SECONDS, rem1 - 0.4))
     try:
         return future.result(timeout=wait1), True
     except concurrent.futures.TimeoutError:
-        send_progressive_speech(handler_input, MSG_PROGRESSIVE)
-        elapsed = time.monotonic() - req_start
-        wait2 = max(0.2, MAX_LAMBDA_SAFE_SECONDS - elapsed)
+        if _remaining_lambda_seconds(req_start) > 1.0:
+            send_progressive_speech(handler_input, MSG_PROGRESSIVE)
+        wait2 = max(0.15, _remaining_lambda_seconds(req_start))
         try:
             return future.result(timeout=wait2), True
         except concurrent.futures.TimeoutError:
@@ -909,6 +935,8 @@ def _converse(handler_input, text):
     if not text and not pending:
         return _ask(handler_input, "Não entendi. Pode repetir?")
     norm = _normalize(text)
+    if norm in LAUNCH_PHRASES:
+        return _ask(handler_input, MSG_WELCOME)
     if norm in STOP_WORDS:
         _pending_tasks.pop(user_id, None)
         return handler_input.response_builder.speak(MSG_BYE).set_should_end_session(True).response
@@ -1093,18 +1121,36 @@ class CatchAllExceptionHandler(AbstractExceptionHandler):
 # ----------------------------------------------------------------------------
 # Skill
 # ----------------------------------------------------------------------------
-def _build_persistence_adapter():
-    table = os.environ.get("DYNAMODB_PERSISTENCE_TABLE_NAME")
-    if not table:
-        raise RuntimeError("DYNAMODB_PERSISTENCE_TABLE_NAME nao definido (use Alexa-hosted ou configure a tabela).")
-    import boto3
+class _LazyDynamoDbAdapter(DynamoDbAdapter):
+    """Inicializa o recurso boto3/DynamoDB sob demanda para nao atrasar o LaunchRequest em cold start."""
 
+    def __init__(self, table_name, region_name):
+        self.table_name = table_name
+        self._region_name = region_name
+        self._real_adapter = None
+
+    def _get_adapter(self):
+        if self._real_adapter is None:
+            import boto3
+
+            self._real_adapter = DynamoDbAdapter(
+                table_name=self.table_name,
+                create_table=False,
+                dynamodb_resource=boto3.resource("dynamodb", region_name=self._region_name),
+            )
+        return self._real_adapter
+
+    def get_attributes(self, request_envelope):
+        return self._get_adapter().get_attributes(request_envelope)
+
+    def save_attributes(self, request_envelope, attributes):
+        return self._get_adapter().save_attributes(request_envelope, attributes)
+
+
+def _build_persistence_adapter():
+    table = os.environ.get("DYNAMODB_PERSISTENCE_TABLE_NAME") or "super_alexa_memory"
     region = os.environ.get("DYNAMODB_PERSISTENCE_REGION") or os.environ.get("AWS_REGION")
-    return DynamoDbAdapter(
-        table_name=table,
-        create_table=False,
-        dynamodb_resource=boto3.resource("dynamodb", region_name=region),
-    )
+    return _LazyDynamoDbAdapter(table_name=table, region_name=region)
 
 
 sb = CustomSkillBuilder(persistence_adapter=_build_persistence_adapter())
@@ -1119,4 +1165,22 @@ sb.add_request_handler(FallbackIntentHandler())
 sb.add_request_handler(SessionEndedRequestHandler())
 sb.add_exception_handler(CatchAllExceptionHandler())
 
-lambda_handler = sb.lambda_handler()
+_raw_lambda_handler = sb.lambda_handler()
+
+
+def lambda_handler(event, context):
+    global _lambda_context
+    _lambda_context = context
+    try:
+        return _raw_lambda_handler(event, context)
+    except BaseException as exc:
+        logger.exception("Erro fatal no lambda_handler: %s", exc)
+        err_msg = clean_for_speech(f"Desculpe, ocorreu um erro ao processar o pedido: {type(exc).__name__}")
+        return {
+            "version": "1.0",
+            "response": {
+                "outputSpeech": {"type": "SSML", "ssml": f"<speak>{err_msg}</speak>"},
+                "reprompt": {"outputSpeech": {"type": "SSML", "ssml": f"<speak>{MSG_REPROMPT}</speak>"}},
+                "shouldEndSession": False,
+            },
+        }
