@@ -44,8 +44,10 @@ MODELS = [m.strip() for m in os.environ.get("AI_MODELS", "").split(",") if m.str
 # Memoria: guardamos TUDO no DynamoDB ate este teto de bytes (item maximo = 400 KB);
 # so ao estourar o teto descartamos as mensagens mais antigas.
 MAX_STORED_BYTES = int(os.environ.get("MAX_STORED_BYTES", str(300 * 1024)))
-# Para a IA enviamos apenas as mensagens mais recentes que cabem neste orcamento de caracteres.
-CONTEXT_CHAR_BUDGET = int(os.environ.get("CONTEXT_CHAR_BUDGET", "12000"))
+# Para a IA enviamos apenas as mensagens mais recentes que cabem neste orcamento de caracteres
+# (3500 chars ~ 900 tokens: evita estourar o limite de 6000-8000 TPM do plano gratuito da Groq!).
+CONTEXT_CHAR_BUDGET = int(os.environ.get("CONTEXT_CHAR_BUDGET", "3500"))
+MAX_CONTEXT_TURNS = int(os.environ.get("MAX_CONTEXT_TURNS", "8"))  # ultimas 8 mensagens (4 trocas completas)
 MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "500"))
 # A Alexa derruba a resposta apos ~8s; deixamos margem.
 TOTAL_BUDGET_SECONDS = float(os.environ.get("AI_TOTAL_BUDGET", "7.2"))
@@ -112,14 +114,20 @@ SWITCH_TO_GEMINI = (
     "usar gemini", "usar o gemini", "mudar para gemini", "mudar para o gemini",
     "trocar para gemini", "trocar para o gemini", "ativar gemini", "ativar o gemini",
     "modo gemini", "ligar gemini",
+    # Formas com a primeira palavra cortada pela Alexa ("mudar {query}", "usar {query}", "ir {query}")
+    "para gemini", "para o gemini", "pro gemini", "o gemini", "no gemini", "pelo gemini", "gemini",
+    "google gemini", "para google gemini", "o google gemini",
 )
 SWITCH_TO_GROQ = (
     "usar groq", "usar o groq", "mudar para groq", "mudar para o groq",
     "trocar para groq", "trocar para o groq", "ativar groq", "ativar o groq",
     "modo groq", "ligar groq",
-    # variacoes comuns de transcricao da Alexa para "groq"
     "usar grok", "usar o grok", "mudar para grok", "trocar para grok", "ativar grok", "modo grok",
     "usar brock", "mudar para brock", "usar glock", "mudar para glock",
+    # Formas com a primeira palavra cortada pela Alexa
+    "para groq", "para o groq", "pro groq", "o groq", "no groq", "pelo groq", "groq",
+    "para grok", "para o grok", "pro grok", "o grok", "no grok", "pelo grok", "grok",
+    "para brock", "para glock",
 )
 STATUS_PHRASES = (
     "qual inteligencia artificial", "qual ia", "qual modelo", "qual provedor",
@@ -251,12 +259,12 @@ def build_gemini_prompt(history, user_text):
     )
 
 
-def ask_gemini(history, user_text, timeout=GEMINI_BUDGET_SECONDS):
+def ask_gemini(history, user_text, timeout=12.0):
     """Chama o Gemini Web (que ja usa a Busca Google nativa)."""
     t0 = time.monotonic()
     loop = _ensure_gemini_loop()
     if not _gemini_ready:
-        if not warmup_gemini(max_wait=max(1.5, timeout - 3.0)):
+        if not warmup_gemini(max_wait=max(2.0, timeout - 3.5)):
             raise AIError("GEMINI_NOT_WARMED")
 
     remaining = timeout - (time.monotonic() - t0)
@@ -545,18 +553,21 @@ def ask_ai(history, user_text, **kwargs):
 
     if provider == "gemini":
         try:
-            gem_timeout = max(3.0, deadline - time.monotonic() - 1.5)
+            gem_timeout = max(4.0, deadline - time.monotonic() - 1.2)
             ans = ask_gemini(history, user_text, timeout=gem_timeout)
             _last_engine_used = "Google Gemini"
             return ans
         except Exception as e:
             logger.warning("Gemini falhou/demorou (%s); fazendo fallback automatico para Groq.", e)
-            return ask_groq(history, user_text, deadline=deadline)
+            try:
+                return ask_groq(history, user_text, deadline=deadline)
+            except Exception as groq_e:
+                raise AIError(f"Gemini ({e}) e fallback Groq ({groq_e})")
     else:
         try:
             return ask_groq(history, user_text, deadline=deadline)
         except AIError as e:
-            if str(e) != "NO_KEY" and (deadline - time.monotonic()) > 3.5:
+            if str(e) != "NO_KEY" and (deadline - time.monotonic()) > 2.5:
                 try:
                     ans = ask_gemini(history, user_text, timeout=deadline - time.monotonic())
                     _last_engine_used = "Google Gemini (fallback)"
@@ -638,8 +649,9 @@ def trim_for_storage(history):
 
 
 def select_context(history):
+    recent_slice = history[-MAX_CONTEXT_TURNS:] if MAX_CONTEXT_TURNS else history
     chosen, total = [], 0
-    for msg in reversed(history):
+    for msg in reversed(recent_slice):
         total += len(msg.get("content", ""))
         if total > CONTEXT_CHAR_BUDGET and chosen:
             break
