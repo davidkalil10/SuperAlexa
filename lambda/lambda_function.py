@@ -1469,51 +1469,17 @@ def _build_persistence_adapter():
         return None
 
 
-_init_error = None
-_raw_lambda_handler = None
+_adapter = _build_persistence_adapter()
+sb = CustomSkillBuilder(persistence_adapter=_adapter) if _adapter else CustomSkillBuilder()
 
-try:
-    _adapter = _build_persistence_adapter()
-    sb = CustomSkillBuilder(persistence_adapter=_adapter) if _adapter else CustomSkillBuilder()
+sb.add_request_handler(LaunchRequestHandler())
+sb.add_request_handler(ChatIntentHandler())
+sb.add_request_handler(CatchAllIntentHandler())
+sb.add_request_handler(ResetHistoryIntentHandler())
+sb.add_request_handler(HelpIntentHandler())
+sb.add_request_handler(CancelOrStopIntentHandler())
+sb.add_request_handler(FallbackIntentHandler())
+sb.add_request_handler(SessionEndedRequestHandler())
+sb.add_exception_handler(CatchAllExceptionHandler())
 
-    sb.add_request_handler(LaunchRequestHandler())
-    sb.add_request_handler(ChatIntentHandler())
-    sb.add_request_handler(CatchAllIntentHandler())
-    sb.add_request_handler(ResetHistoryIntentHandler())
-    sb.add_request_handler(HelpIntentHandler())
-    sb.add_request_handler(CancelOrStopIntentHandler())
-    sb.add_request_handler(FallbackIntentHandler())
-    sb.add_request_handler(SessionEndedRequestHandler())
-    sb.add_exception_handler(CatchAllExceptionHandler())
-
-    _raw_lambda_handler = sb.lambda_handler()
-except Exception as exc:
-    logger.exception("Falha fatal na construcao do CustomSkillBuilder: %s", exc)
-    _init_error = f"{type(exc).__name__}: {str(exc)[:150]}"
-
-
-def lambda_handler(event, context):
-    """Handler principal tolerante a falhas com resposta SSML valida no padrao Alexa."""
-    if _init_error or _raw_lambda_handler is None:
-        msg = clean_for_speech(f"Erro na inicialização da skill: {_init_error or 'Skill nao inicializada'}")
-        return {
-            "version": "1.0",
-            "sessionAttributes": {},
-            "response": {
-                "outputSpeech": {"type": "SSML", "ssml": f"<speak>{msg}</speak>"},
-                "shouldEndSession": True,
-            },
-        }
-    try:
-        return _raw_lambda_handler(event, context)
-    except Exception as exc:
-        logger.exception("Erro fatal no lambda_handler: %s", exc)
-        msg = clean_for_speech(f"Erro fatal ao despachar: {type(exc).__name__} {str(exc)[:120]}")
-        return {
-            "version": "1.0",
-            "sessionAttributes": {},
-            "response": {
-                "outputSpeech": {"type": "SSML", "ssml": f"<speak>{msg}</speak>"},
-                "shouldEndSession": True,
-            },
-        }
+lambda_handler = sb.lambda_handler()
