@@ -1228,6 +1228,8 @@ def _converse(handler_input, text):
 
     if is_status_command(text):
         nome = "Google Gemini" if provider == "gemini" else "Groq"
+        if provider == "gemini" and (not _gemini_ready or _gemini_client is None):
+            warmup_gemini(max_wait=max(1.0, min(3.5, _remaining_lambda_seconds(req_start))))
         if provider == "gemini" and _gemini_ready and _gemini_client is not None:
             cfg = _load_gemini_config()
             cands = _select_gemini_candidates(_gemini_client, cfg["preferred_model"])
@@ -1235,9 +1237,15 @@ def _converse(handler_input, text):
             if _gemini_authenticated:
                 should_save = cfg["save_history"] if gem_save_hist is None else bool(gem_save_hist)
                 modo_hist = "salvando no histórico do Gemini" if should_save else "em modo de chat temporário"
-                nome = f"Google Gemini na sua conta ({top_label}, {cfg['thinking_label']}, {modo_hist})"
+                all_labels = ", ".join(lbl for _, lbl in cands)
+                nome = (
+                    f"Google Gemini conectado na sua conta, priorizando {top_label} com {cfg['thinking_label']}, "
+                    f"{modo_hist}. Modelos liberados na conta: {all_labels}"
+                )
             else:
-                nome = f"Google Gemini ({top_label})"
+                psid, _ = _load_gemini_cookies()
+                motivo = "cookies expirados ou inválidos no secrets" if psid else "sem cookies no secrets"
+                nome = f"Google Gemini em modo anônimo ({top_label}, {motivo})"
         detalhe = f" A última resposta foi gerada por {_last_engine_used}." if _last_engine_used else ""
         return _ask(
             handler_input,
