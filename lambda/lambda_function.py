@@ -80,7 +80,7 @@ _executor = None
 _request_start_time = 0.0
 _lambda_context = None
 PROGRESSIVE_WAIT_SECONDS = 2.0
-MAX_LAMBDA_SAFE_SECONDS = 5.8  # margem segura para NUNCA estourar os 8s do container AWS Lambda (mesmo em cold start)
+MAX_LAMBDA_SAFE_SECONDS = 6.2  # margem segura para NUNCA estourar os 8s do container AWS Lambda (mesmo em cold start)
 CONTINUE_PHRASES = (
     "continuar", "continue", "pode continuar", "pronto", "ok", "pode falar",
     "diga", "me diga", "fale", "e ai", "terminou", "ja terminou", "ler resposta",
@@ -279,8 +279,20 @@ _gemini_ready = False
 _gemini_authenticated = False
 _gemini_init_task = None
 _gemini_init_started = 0.0
+_gemini_init_error = "nenhum"
 _gemini_lock = threading.Lock()
 _gemini_chat_meta_by_user = {}  # {user_id: {"metadata": [cid, rid, rcid], "model_id": str}}
+
+
+def _gemini_init_diagnostic():
+    import sys
+    py_ver = ".".join(map(str, sys.version_info[:3]))
+    try:
+        import gemini_webapi
+        pkg_ver = getattr(gemini_webapi, "__version__", "sem-versao")
+    except Exception as e:
+        pkg_ver = f"err:{type(e).__name__}"
+    return f"{_gemini_init_error}, py {py_ver}, pkg {pkg_ver}"
 
 
 def _ensure_gemini_loop():
@@ -307,10 +319,11 @@ async def _init_gemini_async():
         _gemini_init_task = None
 
     async def _do_init():
-        global _gemini_client, _gemini_ready, _gemini_authenticated
+        global _gemini_client, _gemini_ready, _gemini_authenticated, _gemini_init_error
         try:
             from gemini_webapi import GeminiClient
         except Exception as e:
+            _gemini_init_error = f"import: {type(e).__name__} {str(e)[:30]}"
             logger.error("Falha ao importar GeminiClient: %s", e)
             _gemini_ready = False
             return
@@ -322,35 +335,29 @@ async def _init_gemini_async():
                 AVAILABLE = 1000
                 UNAUTHENTICATED = 1016
 
-        class _FastGeminiClient(GeminiClient):
-            """Otimiza o init() executando apenas _fetch_user_status (descobre modelos da conta em ~0.3s)."""
-
-            async def _init_rpc(self) -> None:
-                await self._fetch_user_status()
-
-            async def _sync_activity(self) -> None:
-                self.last_activity_time = time.time()
-
         psid, psidts = _load_gemini_cookies()
         client = None
         is_auth = False
 
         if psid:
             try:
-                cand = _FastGeminiClient(psid, psidts)
+                cand = GeminiClient(psid, psidts)
                 await cand.init(timeout=12, auto_close=False, auto_refresh=False)
                 status_val = getattr(cand, "account_status", None)
                 is_available = (
                     status_val == 1000
                     or getattr(status_val, "value", None) == 1000
                     or getattr(status_val, "name", "") == "AVAILABLE"
+                    or (status_val is None and getattr(cand, "running", False) and bool(getattr(cand, "access_token", None)))
                 )
                 if is_available:
                     client = cand
                     is_auth = True
-                    models_info = [f"{m.display_name} ({m.model_name})" for m in (cand.list_models() or []) if getattr(m, "is_available", True)]
+                    _gemini_init_error = "ok"
+                    models_info = [f"{m.display_name} ({m.model_name})" for m in (cand.list_models() or []) if getattr(m, "is_available", True)] if hasattr(cand, "list_models") else ["padrao da conta"]
                     logger.info("Gemini Web autenticado na conta com sucesso! Modelos disponiveis: %s", models_info)
                 else:
+                    _gemini_init_error = f"status={status_val}"
                     logger.warning(
                         "Cookies do Gemini nao autenticaram (status=%s); fechando e usando modo anonimo limpo.",
                         status_val,
@@ -361,16 +368,19 @@ async def _init_gemini_async():
                         pass
                     client = None
             except Exception as e:
+                _gemini_init_error = f"init: {type(e).__name__} {str(e)[:35]}"
                 logger.warning("Falha ao inicializar Gemini com cookies (%s); tentando modo anonimo.", e)
                 client = None
 
         if client is None:
             try:
-                client = _FastGeminiClient()
+                client = GeminiClient()
                 await client.init(timeout=10, auto_close=False, auto_refresh=False)
                 is_auth = False
+                _gemini_init_error = "ok-anon"
                 logger.info("Gemini Web inicializado em modo anonimo (sem cookies).")
             except Exception as e:
+                _gemini_init_error = f"anon: {type(e).__name__} {str(e)[:35]}"
                 logger.warning("Falha ao inicializar Gemini anonimo: %s", e)
                 client = None
 
@@ -402,7 +412,7 @@ def warmup_gemini_background():
         logger.warning("Aquecimento do Gemini em background falhou: %s", e)
 
 
-def warmup_gemini(max_wait=6.8):
+def warmup_gemini(max_wait=9.5):
     """Aguarda a inicializacao do Gemini ate max_wait segundos sem cancelar se ainda estiver dentro do prazo normal (~8s)."""
     global _gemini_ready, _gemini_init_task
     if _gemini_ready and _gemini_client is not None:
@@ -422,6 +432,8 @@ def warmup_gemini(max_wait=6.8):
 
 def _select_gemini_candidates(client, preferred_model=""):
     """Retorna a lista ordenada de modelos disponiveis na conta, priorizando o 3.8 Flash."""
+    if not hasattr(client, "list_models"):
+        return [(None, "3.8 Flash")]
     avail = [m for m in (client.list_models() or []) if getattr(m, "is_available", True)]
     if not _gemini_authenticated:
         if avail:
@@ -473,19 +485,21 @@ def build_gemini_prompt(history, user_text, search_query="", web_snippets="", ha
     # Se ja estamos continuando um ChatSession ativo na conta do Gemini, o proprio Gemini ja possui o historico
     if history and not has_active_chat:
         lines = []
-        for m in history[-6:]:
+        for m in history[-4:]:
             role = "Usuário" if m.get("role") == "user" else "Assistente"
             lines.append(f"{role}: {m.get('content', '')}")
-        ctx = "Histórico recente da conversa:\n" + "\n".join(lines) + "\n\n"
+        ctx = "Histórico recente:\n" + "\n".join(lines) + "\n\n"
     search_block = ""
     if web_snippets:
-        search_block = f"[Resultados de pesquisa na web para \"{search_query}\":\n{web_snippets}]\n\n"
+        search_block = f"[Contexto de pesquisa:\n{web_snippets[:400]}]\n\n"
+    hoje_str, ano_atual = _current_br_date()
     return (
-        f"{get_system_prompt()}\n\n"
+        f"Você é a Super Alexa, assistente de voz inteligente e natural. Hoje é {hoje_str} (ano de {ano_atual}). "
+        "Responda SEMPRE em português do Brasil com acentuação correta, de forma direta e curta para voz "
+        "(no máximo 2 ou 3 frases, sem markdown, sem listas e sem asteriscos).\n\n"
         f"{ctx}"
         f"{search_block}"
-        f"Nova fala do usuário (pode ter tido a primeira palavra cortada pela Alexa): {user_text}\n\n"
-        "Responda agora em português do Brasil (com acentuação correta) em no máximo 2 ou 3 frases curtas para voz, sem markdown:"
+        f"Pergunta do usuário: {user_text}"
     )
 
 
@@ -498,13 +512,15 @@ def ask_gemini(
     user_id="default",
     save_gemini_history=None,
     gemini_chat_metadata=None,
+    deadline=None,
 ):
     """Chama o Gemini Web (anonimo ou autenticado na conta com selecao de modelo e controle de historico)."""
     global _gemini_ready, _gemini_init_task, _last_engine_used
     t0 = time.monotonic()
     loop = _ensure_gemini_loop()
     if not _gemini_ready or _gemini_client is None:
-        if not warmup_gemini(max_wait=min(6.8, max(2.5, timeout - 1.5))):
+        warm_budget = (deadline - time.monotonic() - 4.5) if deadline else (timeout - 2.0)
+        if not warmup_gemini(max_wait=min(9.5, max(3.0, warm_budget))):
             raise AIError("GEMINI_NOT_WARMED")
 
     cfg = _load_gemini_config()
@@ -516,7 +532,10 @@ def ask_gemini(
     last_err = None
 
     for model_obj, model_label in candidates:
-        remaining = timeout - (time.monotonic() - t0)
+        if deadline:
+            remaining = deadline - time.monotonic() - 1.5
+        else:
+            remaining = timeout - (time.monotonic() - t0)
         if remaining < 1.2:
             break
 
@@ -543,17 +562,23 @@ def ask_gemini(
             has_active_chat=has_active_chat,
         )
 
+        gen_kwargs = {}
+        if hasattr(_gemini_client, "_model_registry"):
+            if model_obj is not None:
+                gen_kwargs["model"] = model_obj
+            if _gemini_authenticated:
+                gen_kwargs["temporary"] = not should_save_history
+            gen_kwargs["extended_thinking"] = extended_thinking
+
         for chat_attempt in range(2):
-            remaining = timeout - (time.monotonic() - t0)
+            remaining = (deadline - time.monotonic() - 1.5) if deadline else (timeout - (time.monotonic() - t0))
             if remaining < 1.0:
                 break
             try:
                 coro = _gemini_client.generate_content(
                     prompt,
-                    model=model_obj,
                     chat=chat_session,
-                    temporary=(not should_save_history) if _gemini_authenticated else False,
-                    extended_thinking=extended_thinking,
+                    **gen_kwargs
                 )
                 fut = asyncio.run_coroutine_threadsafe(coro, loop)
                 resp = fut.result(timeout=remaining)
@@ -1007,7 +1032,7 @@ def ask_ai(history, user_text, **kwargs):
 
     search_query = build_search_query(history, user_text, fallback_topic=fallback_topic)
     web_snippets = ""
-    if WEB_SEARCH_ENABLED and (deadline - time.monotonic()) > 3.0:
+    if provider == "groq" and WEB_SEARCH_ENABLED and (deadline - time.monotonic()) > 3.0:
         web_snippets = fetch_web_snippets(
             search_query, timeout=min(WEB_SEARCH_TIMEOUT, deadline - time.monotonic() - 2.0)
         )
@@ -1018,12 +1043,12 @@ def ask_ai(history, user_text, **kwargs):
 
     if provider == "gemini":
         try:
-            # Reserva pelo menos 3.2s do orcamento para o fallback Groq caso o Gemini falhe!
-            gem_timeout = max(5.0, min(14.0, deadline - time.monotonic() - 2.2))
+            gem_timeout = max(6.0, deadline - time.monotonic() - 1.8)
             return ask_gemini(
                 history,
                 effective_question,
                 timeout=gem_timeout,
+                deadline=deadline,
                 search_query=search_query,
                 web_snippets=web_snippets,
                 user_id=user_id,
@@ -1033,6 +1058,8 @@ def ask_ai(history, user_text, **kwargs):
         except Exception as e:
             logger.warning("Gemini falhou/demorou (%s); fazendo fallback automatico para Groq.", e)
             try:
+                if WEB_SEARCH_ENABLED and (deadline - time.monotonic()) > 3.8:
+                    web_snippets = fetch_web_snippets(search_query, timeout=min(1.5, deadline - time.monotonic() - 2.0))
                 return ask_groq(
                     history,
                     effective_question,
@@ -1326,7 +1353,7 @@ def _converse(handler_input, text):
             modo_hist = "salvando histórico no seu Gemini" if should_save else "em modo de chat temporário"
 
             if not _gemini_ready or _gemini_client is None:
-                warmup_gemini(max_wait=7.0)
+                warmup_gemini(max_wait=6.2)
 
             if _gemini_ready and _gemini_client is not None:
                 cands = _select_gemini_candidates(_gemini_client, cfg["preferred_model"])
@@ -1341,9 +1368,10 @@ def _converse(handler_input, text):
                     motivo = "cookies expiraram ou foram recusados" if psid else "sem cookies configurados"
                     nome = f"Google Gemini em modo anônimo ({top_label}, {motivo})"
             else:
+                logger.info("Diagnostico do Gemini: %s", _gemini_init_diagnostic())
                 if psid:
-                    pref_label = cfg["preferred_model"] or "priorizando 3.8 Flash"
-                    nome = f"Google Gemini ({pref_label}, inicializando)"
+                    pref_label = cfg["preferred_model"] or "3.8 Flash"
+                    nome = f"Google Gemini (priorizando {pref_label}, conectando à sua conta)"
                 else:
                     nome = "Google Gemini em modo anônimo (gratuito, sem cookies no secrets.json)"
         else:
@@ -1552,3 +1580,9 @@ sb.add_request_handler(SessionEndedRequestHandler())
 sb.add_exception_handler(CatchAllExceptionHandler())
 
 lambda_handler = sb.lambda_handler()
+
+# Inicia o aquecimento do Gemini em background no carregamento do modulo Lambda
+try:
+    warmup_gemini_background()
+except Exception as _e:
+    logger.debug("Aquecimento inicial do modulo ignorado: %s", _e)

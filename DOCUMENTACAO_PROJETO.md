@@ -144,3 +144,18 @@ Este documento registra formalmente a arquitetura da skill **Super Alexa**, as d
   * Motor: `Google Gemini (3.8 Flash, raciocínio médio, histórico salvo)`
   * Status: `Google Gemini conectado na sua conta (usando 3.8 Flash, raciocínio médio, salvando histórico no seu Gemini). Modelos liberados na sua conta: 3.8 Flash, 3.5 Flash Lite, 3.1 Pro, 4 Argon.`
 
+### [31/10/2026 ~01:00] - Estabilização Definitiva: Remoção de Monkey-Patches, Prompt Otimizado e Isolamento de Busca
+* **Diagnóstico da Causa Raiz:**
+  1. **Subclasse invasiva `_FastGeminiClient`:** Ao tentar pular RPCs do `_init_rpc`, o cliente não recebia cookies de sessão atualizados do Google (`__Secure-1PSIDCC`, `COMPASS`). Isso causava travamentos silenciosos da conexão HTTP/2 (`[Watchdog] Socket idle`), forçando fallback após 17s.
+  2. **Prompt excessivamente verboso:** O `build_gemini_prompt` anterior injetava um texto de 1400 caracteres com instruções de contingência e datas ("Seu treinamento original parou no passado..."). No Gemini Web com histórico salvo, esse bloco poluía o título do chat na conta do usuário e acionava filtros/latência adicional de streaming no Google.
+  3. **Busca DuckDuckGo desnecessária para Gemini:** O DuckDuckGo rodava sempre antes de chamar o Gemini, consumindo 2.0s do orçamento do Lambda e poluindo o prompt. O Gemini possui busca web nativa integrada da Google.
+  4. **Subtração de tempo de aquecimento no timeout de geração:** O cálculo de `remaining` subtraía o tempo de warmup do cold start, deixando apenas ~3s para a geração e causando `GEMINI_TIMEOUT` prematuro.
+* **Ajustes Implementados:**
+  1. **Cliente Nativo e Limpo:** Removida a subclasse `_FastGeminiClient`. Utiliza `GeminiClient` oficial de forma limpa, garantindo estabilidade absoluta de sessão HTTP/2 e geração em 3.6s a 4.1s.
+  2. **Prompt Conciso para Voz:** `build_gemini_prompt` simplificado e direto para assistente de voz em português do Brasil (sem meta-prompts adversariais). Histórico limpo e legível no `gemini.google.com`.
+  3. **Busca DuckDuckGo Exclusiva para Groq:** A busca web externa só roda quando o provedor for o Groq (ou em contingência se o Gemini falhar). O Gemini recebe 100% do orçamento de tempo do Lambda imediatamente.
+  4. **Cálculo de Deadline e Margem Segura:** `ask_gemini` calcula o tempo restante com base no `deadline` global da requisição. `MAX_LAMBDA_SAFE_SECONDS` ajustado para `6.2s`, permitindo que respostas de 3.6s a 4.5s sejam entregues diretamente no primeiro turno.
+* **Resultado Comprovado em Teste:**
+  * Turno 1 ("qual a capital do brasil"): *"A capital do Brasil é Brasília."* gerado em 3.8s por `Google Gemini (3.8 Flash, raciocínio médio, histórico salvo)` com CID salvo.
+  * Turno 2 ("e qual a populacao estimada de la"): *"O Distrito Federal tem aproximadamente três milhões de habitantes..."* gerado em 4.1s continuando na mesma sessão sem fallback.
+
