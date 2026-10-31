@@ -344,7 +344,6 @@ async def _init_gemini_async():
                     status_val == 1000
                     or getattr(status_val, "value", None) == 1000
                     or getattr(status_val, "name", "") == "AVAILABLE"
-                    or getattr(cand, "running", False)
                 )
                 if is_available:
                     client = cand
@@ -353,13 +352,17 @@ async def _init_gemini_async():
                     logger.info("Gemini Web autenticado na conta com sucesso! Modelos disponiveis: %s", models_info)
                 else:
                     logger.warning(
-                        "Cookies do Gemini nao autenticaram (status=%s); usando sessao como anonima.",
+                        "Cookies do Gemini nao autenticaram (status=%s); fechando e usando modo anonimo limpo.",
                         status_val,
                     )
-                    client = cand
-                    is_auth = False
+                    try:
+                        await cand.close()
+                    except Exception:
+                        pass
+                    client = None
             except Exception as e:
                 logger.warning("Falha ao inicializar Gemini com cookies (%s); tentando modo anonimo.", e)
+                client = None
 
         if client is None:
             try:
