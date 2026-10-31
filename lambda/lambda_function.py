@@ -80,7 +80,7 @@ _executor = None
 _request_start_time = 0.0
 _lambda_context = None
 PROGRESSIVE_WAIT_SECONDS = 2.0
-MAX_LAMBDA_SAFE_SECONDS = 5.2  # margem segura para NUNCA estourar os 8s do container AWS Lambda (mesmo em cold start)
+MAX_LAMBDA_SAFE_SECONDS = 5.8  # margem segura para NUNCA estourar os 8s do container AWS Lambda (mesmo em cold start)
 CONTINUE_PHRASES = (
     "continuar", "continue", "pode continuar", "pronto", "ok", "pode falar",
     "diga", "me diga", "fale", "e ai", "terminou", "ja terminou", "ler resposta",
@@ -223,16 +223,26 @@ def _load_gemini_cookies():
     psid = (
         os.environ.get("GEMINI_1PSID")
         or os.environ.get("__Secure-1PSID")
+        or os.environ.get("GEMINI_3PSID")
+        or os.environ.get("__Secure-3PSID")
         or data.get("GEMINI_1PSID")
         or data.get("Secure_1PSID")
         or data.get("__Secure-1PSID")
+        or data.get("GEMINI_3PSID")
+        or data.get("Secure_3PSID")
+        or data.get("__Secure-3PSID")
     )
     psidts = (
         os.environ.get("GEMINI_1PSIDTS")
         or os.environ.get("__Secure-1PSIDTS")
+        or os.environ.get("GEMINI_3PSIDTS")
+        or os.environ.get("__Secure-3PSIDTS")
         or data.get("GEMINI_1PSIDTS")
         or data.get("Secure_1PSIDTS")
         or data.get("__Secure-1PSIDTS")
+        or data.get("GEMINI_3PSIDTS")
+        or data.get("Secure_3PSIDTS")
+        or data.get("__Secure-3PSIDTS")
     )
     return _clean_cookie_val(psid), _clean_cookie_val(psidts)
 
@@ -298,8 +308,19 @@ async def _init_gemini_async():
 
     async def _do_init():
         global _gemini_client, _gemini_ready, _gemini_authenticated
-        from gemini_webapi import GeminiClient
-        from gemini_webapi.constants import AccountStatus
+        try:
+            from gemini_webapi import GeminiClient
+        except Exception as e:
+            logger.error("Falha ao importar GeminiClient: %s", e)
+            _gemini_ready = False
+            return
+
+        try:
+            from gemini_webapi.constants import AccountStatus
+        except Exception:
+            class AccountStatus:
+                AVAILABLE = 1000
+                UNAUTHENTICATED = 1016
 
         class _FastGeminiClient(GeminiClient):
             """Otimiza o init() executando apenas _fetch_user_status (descobre modelos da conta em ~0.3s)."""
@@ -317,30 +338,45 @@ async def _init_gemini_async():
         if psid:
             try:
                 cand = _FastGeminiClient(psid, psidts)
-                await cand.init(timeout=15, auto_close=False, auto_refresh=True)
-                if getattr(cand, "account_status", None) == AccountStatus.AVAILABLE:
+                await cand.init(timeout=12, auto_close=False, auto_refresh=False)
+                status_val = getattr(cand, "account_status", None)
+                is_available = (
+                    status_val == 1000
+                    or getattr(status_val, "value", None) == 1000
+                    or getattr(status_val, "name", "") == "AVAILABLE"
+                    or getattr(cand, "running", False)
+                )
+                if is_available:
                     client = cand
                     is_auth = True
-                    models_info = [f"{m.display_name} ({m.model_name})" for m in (cand.list_models() or []) if m.is_available]
+                    models_info = [f"{m.display_name} ({m.model_name})" for m in (cand.list_models() or []) if getattr(m, "is_available", True)]
                     logger.info("Gemini Web autenticado na conta com sucesso! Modelos disponiveis: %s", models_info)
                 else:
                     logger.warning(
-                        "Cookies do Gemini nao autenticaram (status=%s); usando modo anonimo como fallback.",
-                        getattr(cand, "account_status", None),
+                        "Cookies do Gemini nao autenticaram (status=%s); usando sessao como anonima.",
+                        status_val,
                     )
-                    await cand.close()
+                    client = cand
+                    is_auth = False
             except Exception as e:
-                logger.warning("Falha ao inicializar Gemini com cookies (%s); usando modo anonimo.", e)
+                logger.warning("Falha ao inicializar Gemini com cookies (%s); tentando modo anonimo.", e)
 
         if client is None:
-            client = _FastGeminiClient()
-            await client.init(timeout=15, auto_close=False, auto_refresh=False)
-            is_auth = False
-            logger.info("Gemini Web inicializado em modo anonimo (sem cookies).")
+            try:
+                client = _FastGeminiClient()
+                await client.init(timeout=10, auto_close=False, auto_refresh=False)
+                is_auth = False
+                logger.info("Gemini Web inicializado em modo anonimo (sem cookies).")
+            except Exception as e:
+                logger.warning("Falha ao inicializar Gemini anonimo: %s", e)
+                client = None
 
-        _gemini_client = client
-        _gemini_authenticated = is_auth
-        _gemini_ready = True
+        if client is not None:
+            _gemini_client = client
+            _gemini_authenticated = is_auth
+            _gemini_ready = True
+        else:
+            _gemini_ready = False
 
     _gemini_init_started = time.monotonic()
     _gemini_init_task = asyncio.create_task(_do_init())
@@ -363,7 +399,7 @@ def warmup_gemini_background():
         logger.warning("Aquecimento do Gemini em background falhou: %s", e)
 
 
-def warmup_gemini(max_wait=5.0):
+def warmup_gemini(max_wait=6.8):
     """Aguarda a inicializacao do Gemini ate max_wait segundos sem cancelar se ainda estiver dentro do prazo normal (~8s)."""
     global _gemini_ready, _gemini_init_task
     if _gemini_ready and _gemini_client is not None:
@@ -372,14 +408,12 @@ def warmup_gemini(max_wait=5.0):
         loop = _ensure_gemini_loop()
         fut = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
         fut.result(timeout=max_wait)
-        return True
+        return bool(_gemini_ready and _gemini_client is not None)
     except concurrent.futures.TimeoutError:
         logger.warning("Aquecimento do Gemini ainda em andamento apos %.1fs (continua em background).", max_wait)
         return False
     except Exception as e:
         logger.warning("Aquecimento do Gemini falhou: %s", e)
-        _gemini_ready = False
-        _gemini_init_task = None
         return False
 
 
@@ -455,7 +489,7 @@ def ask_gemini(
     t0 = time.monotonic()
     loop = _ensure_gemini_loop()
     if not _gemini_ready or _gemini_client is None:
-        if not warmup_gemini(max_wait=min(4.2, max(2.0, timeout - 2.2))):
+        if not warmup_gemini(max_wait=min(6.8, max(2.5, timeout - 1.5))):
             raise AIError("GEMINI_NOT_WARMED")
 
     cfg = _load_gemini_config()
@@ -970,7 +1004,7 @@ def ask_ai(history, user_text, **kwargs):
     if provider == "gemini":
         try:
             # Reserva pelo menos 3.2s do orcamento para o fallback Groq caso o Gemini falhe!
-            gem_timeout = max(4.0, min(11.5, deadline - time.monotonic() - 3.2))
+            gem_timeout = max(5.0, min(14.0, deadline - time.monotonic() - 2.2))
             return ask_gemini(
                 history,
                 effective_question,
@@ -1276,6 +1310,9 @@ def _converse(handler_input, text):
             should_save = cfg["save_history"] if gem_save_hist is None else bool(gem_save_hist)
             modo_hist = "salvando histórico no seu Gemini" if should_save else "em modo de chat temporário"
 
+            if not _gemini_ready or _gemini_client is None:
+                warmup_gemini(max_wait=5.0)
+
             if _gemini_ready and _gemini_client is not None:
                 cands = _select_gemini_candidates(_gemini_client, cfg["preferred_model"])
                 top_label = cands[0][1] if cands else "padrão"
@@ -1291,7 +1328,7 @@ def _converse(handler_input, text):
             else:
                 if psid:
                     pref_label = cfg["preferred_model"] or "priorizando 3.8 Flash"
-                    nome = f"Google Gemini com sua conta configurada ({pref_label}, {cfg['thinking_label']}, {modo_hist})"
+                    nome = f"Google Gemini ({pref_label}, inicializando)"
                 else:
                     nome = "Google Gemini em modo anônimo (gratuito, sem cookies no secrets.json)"
         else:
@@ -1358,11 +1395,11 @@ def _converse(handler_input, text):
             return _ask(handler_input, MSG_HOLD)
     except AIError as e:
         logger.error("Falha na IA: %s", e)
-        msg = MSG_NO_KEY if str(e) == "NO_KEY" else (MSG_TIMEOUT if str(e) == "TIMEOUT" else f"Desculpe, ocorreu o erro: {clean_for_speech(str(e)[:120])}")
+        msg = MSG_NO_KEY if str(e) == "NO_KEY" else (MSG_TIMEOUT if str(e) == "TIMEOUT" else MSG_ERROR)
         return _ask(handler_input, msg)
     except Exception as e:
         logger.error("Falha inesperada na IA: %s", e)
-        return _ask(handler_input, f"Desculpe, ocorreu o erro técnico: {clean_for_speech(type(e).__name__ + ' ' + str(e)[:120])}")
+        return _ask(handler_input, MSG_ERROR)
 
     history += [
         {"role": "user", "content": text},
@@ -1378,6 +1415,7 @@ class LaunchRequestHandler(AbstractRequestHandler):
         return ask_utils.is_request_type("LaunchRequest")(handler_input)
 
     def handle(self, handler_input):
+        warmup_gemini_background()
         return _ask(handler_input, MSG_WELCOME)
 
 
@@ -1453,10 +1491,7 @@ class CatchAllExceptionHandler(AbstractExceptionHandler):
 
     def handle(self, handler_input, exception):
         logger.exception("Erro nao tratado: %s", exception)
-        return _ask(
-            handler_input,
-            f"Desculpe, erro interno no handler: {clean_for_speech(type(exception).__name__ + ' ' + str(exception)[:120])}",
-        )
+        return _ask(handler_input, MSG_ERROR)
 
 
 # ----------------------------------------------------------------------------

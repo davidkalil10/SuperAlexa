@@ -106,3 +106,19 @@ Este documento registra formalmente a arquitetura da skill **Super Alexa**, as d
   2. A fala da Alexa deve ser sempre amigável e natural. Erros internos devem ir para os logs do CloudWatch (`logger.warning`), nunca para o SSML falado.
   3. A estabilidade do fluxo de voz é a prioridade número 1.
 * **Ação Executada:** Código revertido integralmente para o estado estável de `ac46b83`, restaurando a fluidez da skill.
+
+### [30/10/2026 ~22:25] - Diagnóstico de Gravação no Histórico do Gemini e Correção do Cold Start
+* **Diagnóstico da Causa Raiz:**
+  * O teste local provou que os cookies salvos em `secrets.json` funcionam 100% e criam conversas reais no `gemini.google.com` (ex: IDs `c_ef647d5facb9d94e` e `c_92c7d8ef07b71a30`).
+  * Porém, nas conversas pela Alexa, as perguntas estavam sendo respondidas pelo Groq (`A última resposta foi gerada por Groq (gpt-oss-120b)`), e por isso nada era gravado no histórico do Google.
+  * O motivo do fallback prematuro para o Groq:
+    1. O `warmup_gemini` em `ask_gemini` estava limitado a apenas `min(4.2s, ...)`. Como o handshake de inicialização do cliente na AWS Lambda leva ~5.8s em cold start, o timeout estourava e disparava imediatamente o fallback silencioso para o Groq.
+    2. O `LaunchRequestHandler` não disparava `warmup_gemini_background()` na abertura da skill, desperdiçando os 4 segundos em que a Alexa fala as boas-vindas para já deixar o Gemini aquecido.
+    3. No comando de status (`is_status_command`), se o Gemini ainda estivesse finalizando a conexão, ele não aguardava e exibia o rótulo de fallback.
+* **Ajustes Implementados:**
+  1. **Aquecimento no `LaunchRequest`:** Adicionado `warmup_gemini_background()` ao `LaunchRequestHandler.handle()`. Enquanto a Alexa fala a saudação inicial, o handshake com o Gemini é concluído em segundo plano.
+  2. **Orçamento Realista de Warmup:** Ajustado o teto do `warmup_gemini` em `ask_gemini` de `4.2s` para `min(6.8s, max(2.5, timeout - 1.5))`, permitindo que o Gemini conclua sua inicialização sem abortar prematuramente.
+  3. **Aguardar no Status:** No comando de status sobre modelo ativo, se o Gemini estiver aquecendo, o sistema aguarda até 5s para reportar o status real de conexão da conta com os modelos disponíveis.
+  4. **Proteção Total contra Vazamento de Erros:** Exceções não tratadas e `AIError` genéricos agora devolvem estritamente a mensagem padrão amigável (`MSG_ERROR`), garantindo que nomes de classes técnicas do Python nunca sejam pronunciados pela Alexa.
+  5. **Compatibilidade Defensiva de Enums:** Imports de `AccountStatus` e verificação de status (`1000` / `AVAILABLE`) protegidos contra diferenças de versão no Lambda.
+
