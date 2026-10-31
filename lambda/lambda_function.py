@@ -2,142 +2,6 @@
 """Super Alexa - Custom Skill que conversa com IA (Gemini Web Anonimo/Autenticado ou Groq),
 com pesquisa na web, alternancia de provedor por voz e memoria persistente no DynamoDB.
 """
-import sys
-
-# Compatibilidade Python 3.8 (PEP 563):
-# Injeta 'from __future__ import annotations' no gemini_webapi no Python < 3.10
-# para permitir type hints com '|' (PEP 604) sem TypeError em tempo de execucao.
-if sys.version_info < (3, 10):
-    # Backports da biblioteca padrao para Python 3.8 / 3.9
-    import datetime
-    if not hasattr(datetime, "UTC"):
-        datetime.UTC = datetime.timezone.utc
-
-    import functools
-    if not hasattr(functools, "cache"):
-        functools.cache = functools.lru_cache(maxsize=None)
-
-    import enum
-    if not hasattr(enum, "StrEnum"):
-        class StrEnum(str, enum.Enum):
-            def __str__(self):
-                return str(self.value)
-        enum.StrEnum = StrEnum
-
-    try:
-        from importlib.machinery import SourceFileLoader
-
-        _orig_get_code = SourceFileLoader.get_code
-        _orig_source_to_code = SourceFileLoader.source_to_code
-
-        def _patch_gemini_source(data):
-            header = b"from __future__ import annotations\n"
-            if isinstance(data, (bytes, bytearray)):
-                if not data.startswith(header):
-                    return header + bytes(data)
-                return data
-            if isinstance(data, str):
-                if not data.startswith("from __future__ import annotations"):
-                    return "from __future__ import annotations\n" + data
-                return data
-            return data
-
-        def _py38_get_code(self, fullname):
-            if "gemini_webapi" in fullname:
-                try:
-                    filename = self.get_filename(fullname)
-                    data = self.get_data(filename)
-                    data = _patch_gemini_source(data)
-                    return self.source_to_code(data, filename)
-                except Exception:
-                    pass
-            return _orig_get_code(self, fullname)
-
-        def _py38_source_to_code(self, data, path, _optimize=-1):
-            if "gemini_webapi" in str(path):
-                data = _patch_gemini_source(data)
-            return _orig_source_to_code(self, data, path, _optimize=_optimize)
-
-        SourceFileLoader.get_code = _py38_get_code
-        SourceFileLoader.source_to_code = _py38_source_to_code
-    except Exception:
-        pass
-
-    # Garante eval_type_backport para Pydantic resolver 'bytes | str' no Python 3.8
-    if "eval_type_backport" not in sys.modules:
-        try:
-            import ast
-            import types
-            import typing
-
-            _GENERIC_MAP = {
-                "list": "List", "dict": "Dict", "tuple": "Tuple",
-                "set": "Set", "frozenset": "FrozenSet", "type": "Type",
-            }
-
-            class _BackportTransformer(ast.NodeTransformer):
-                def visit_BinOp(self, node):
-                    self.generic_visit(node)
-                    if isinstance(node.op, ast.BitOr):
-                        elts = []
-                        def collect(n):
-                            if isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr):
-                                collect(n.left)
-                                collect(n.right)
-                            else:
-                                elts.append(n)
-                        collect(node)
-                        tup = ast.Tuple(elts=elts, ctx=ast.Load())
-                        slice_node = ast.Index(value=tup) if sys.version_info < (3, 9) else tup
-                        return ast.Subscript(
-                            value=ast.Name(id="_Union", ctx=ast.Load()),
-                            slice=slice_node,
-                            ctx=ast.Load()
-                        )
-                    return node
-
-                def visit_Subscript(self, node):
-                    self.generic_visit(node)
-                    if isinstance(node.value, ast.Name) and node.value.id in _GENERIC_MAP:
-                        node.value = ast.Name(id="_" + _GENERIC_MAP[node.value.id], ctx=node.value.ctx)
-                    return node
-
-            def _inline_eval_type_backport(value, globalns=None, localns=None, *args, **kwargs):
-                if isinstance(value, typing.ForwardRef):
-                    arg = value.__forward_arg__
-                elif isinstance(value, str):
-                    arg = value
-                else:
-                    try:
-                        return typing._eval_type(value, globalns, localns)
-                    except Exception:
-                        return value
-                try:
-                    tree = ast.parse(arg, mode="eval")
-                    new_tree = _BackportTransformer().visit(tree)
-                    ast.fix_missing_locations(new_tree)
-                    code = compile(new_tree, "<type_backport>", "eval")
-                    eval_globals = dict(globalns or {})
-                    eval_globals.setdefault("_Union", typing.Union)
-                    eval_globals.setdefault("Union", typing.Union)
-                    eval_globals.setdefault("Optional", typing.Optional)
-                    eval_globals.setdefault("_List", typing.List)
-                    eval_globals.setdefault("_Dict", typing.Dict)
-                    eval_globals.setdefault("_Tuple", typing.Tuple)
-                    eval_globals.setdefault("_Set", typing.Set)
-                    eval_globals.setdefault("_FrozenSet", typing.FrozenSet)
-                    eval_globals.setdefault("_Type", typing.Type)
-                    return eval(code, eval_globals, localns or {})
-                except Exception:
-                    return typing._eval_type(value, globalns, localns)
-
-            _mod = types.ModuleType("eval_type_backport")
-            _mod.eval_type_backport = _inline_eval_type_backport
-            _mod.install_patch = lambda: None
-            sys.modules["eval_type_backport"] = _mod
-        except Exception:
-            pass
-
 import asyncio
 import concurrent.futures
 import html
@@ -329,23 +193,12 @@ MSG_NO_KEY = "A chave da inteligência artificial não está configurada. Verifi
 
 
 def _load_secrets():
-    candidates = [
-        os.path.join(os.path.dirname(__file__), "secrets.json"),
-        os.path.join(os.getcwd(), "secrets.json"),
-        os.path.join(os.getcwd(), "lambda", "secrets.json"),
-        "/var/task/secrets.json",
-        "/var/task/lambda/secrets.json",
-    ]
-    for p in candidates:
-        try:
-            if os.path.isfile(p):
-                with open(p, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if data and isinstance(data, dict):
-                        return data
-        except Exception:
-            pass
-    return {}
+    path = os.path.join(os.path.dirname(__file__), "secrets.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
 
 
 def _load_api_key():
@@ -370,26 +223,16 @@ def _load_gemini_cookies():
     psid = (
         os.environ.get("GEMINI_1PSID")
         or os.environ.get("__Secure-1PSID")
-        or os.environ.get("GEMINI_3PSID")
-        or os.environ.get("__Secure-3PSID")
         or data.get("GEMINI_1PSID")
         or data.get("Secure_1PSID")
         or data.get("__Secure-1PSID")
-        or data.get("GEMINI_3PSID")
-        or data.get("Secure_3PSID")
-        or data.get("__Secure-3PSID")
     )
     psidts = (
         os.environ.get("GEMINI_1PSIDTS")
         or os.environ.get("__Secure-1PSIDTS")
-        or os.environ.get("GEMINI_3PSIDTS")
-        or os.environ.get("__Secure-3PSIDTS")
         or data.get("GEMINI_1PSIDTS")
         or data.get("Secure_1PSIDTS")
         or data.get("__Secure-1PSIDTS")
-        or data.get("GEMINI_3PSIDTS")
-        or data.get("Secure_3PSIDTS")
-        or data.get("__Secure-3PSIDTS")
     )
     return _clean_cookie_val(psid), _clean_cookie_val(psidts)
 
@@ -424,67 +267,89 @@ _gemini_loop = None
 _gemini_client = None
 _gemini_ready = False
 _gemini_authenticated = False
-_gemini_init_error = None
+_gemini_init_task = None
+_gemini_init_started = 0.0
 _gemini_lock = threading.Lock()
 _gemini_chat_meta_by_user = {}  # {user_id: {"metadata": [cid, rid, rcid], "model_id": str}}
 
 
 def _ensure_gemini_loop():
     global _gemini_loop
-    with _gemini_lock:
-        if _gemini_loop is None or _gemini_loop.is_closed() or not _gemini_loop.is_running():
-            if _gemini_loop and not _gemini_loop.is_closed():
-                try:
-                    _gemini_loop.stop()
-                except Exception:
-                    pass
-            _gemini_loop = asyncio.new_event_loop()
-            t = threading.Thread(target=_gemini_loop.run_forever, daemon=True)
-            t.start()
-            time.sleep(0.05)
+    if _gemini_loop is None:
+        _gemini_loop = asyncio.new_event_loop()
+        t = threading.Thread(target=_gemini_loop.run_forever, daemon=True)
+        t.start()
     return _gemini_loop
 
 
 async def _init_gemini_async():
-    global _gemini_client, _gemini_ready, _gemini_authenticated, _gemini_init_error
+    global _gemini_client, _gemini_ready, _gemini_authenticated, _gemini_init_task, _gemini_init_started
     if _gemini_ready and _gemini_client is not None:
         return
+    if _gemini_init_task is not None and not _gemini_init_task.done():
+        if (time.monotonic() - _gemini_init_started) <= 16.0:
+            await _gemini_init_task
+            return
+        try:
+            _gemini_init_task.cancel()
+        except Exception:
+            pass
+        _gemini_init_task = None
 
-    _gemini_init_error = None
-    from gemini_webapi import GeminiClient
+    async def _do_init():
+        global _gemini_client, _gemini_ready, _gemini_authenticated
+        from gemini_webapi import GeminiClient
+        from gemini_webapi.constants import AccountStatus
 
-    psid, psidts = _load_gemini_cookies()
-    if not psid:
-        _gemini_init_error = "Cookies nao configurados no secrets.json"
-        _gemini_client = None
-        _gemini_authenticated = False
-        _gemini_ready = False
-        logger.warning("Nenhum cookie __Secure-1PSID encontrado no secrets.json ou variaveis de ambiente.")
-        return
+        class _FastGeminiClient(GeminiClient):
+            """Otimiza o init() executando apenas _fetch_user_status (descobre modelos da conta em ~0.3s)."""
 
-    try:
-        cand = GeminiClient(psid, psidts)
-        await cand.init(timeout=8, auto_close=False, auto_refresh=False)
-        _gemini_client = cand
+            async def _init_rpc(self) -> None:
+                await self._fetch_user_status()
+
+            async def _sync_activity(self) -> None:
+                self.last_activity_time = time.time()
+
+        psid, psidts = _load_gemini_cookies()
+        client = None
+        is_auth = False
+
+        if psid:
+            try:
+                cand = _FastGeminiClient(psid, psidts)
+                await cand.init(timeout=15, auto_close=False, auto_refresh=True)
+                if getattr(cand, "account_status", None) == AccountStatus.AVAILABLE:
+                    client = cand
+                    is_auth = True
+                    models_info = [f"{m.display_name} ({m.model_name})" for m in (cand.list_models() or []) if m.is_available]
+                    logger.info("Gemini Web autenticado na conta com sucesso! Modelos disponiveis: %s", models_info)
+                else:
+                    logger.warning(
+                        "Cookies do Gemini nao autenticaram (status=%s); usando modo anonimo como fallback.",
+                        getattr(cand, "account_status", None),
+                    )
+                    await cand.close()
+            except Exception as e:
+                logger.warning("Falha ao inicializar Gemini com cookies (%s); usando modo anonimo.", e)
+
+        if client is None:
+            client = _FastGeminiClient()
+            await client.init(timeout=15, auto_close=False, auto_refresh=False)
+            is_auth = False
+            logger.info("Gemini Web inicializado em modo anonimo (sem cookies).")
+
+        _gemini_client = client
+        _gemini_authenticated = is_auth
         _gemini_ready = True
-        status_val = getattr(cand, "account_status", None)
-        is_avail = (
-            status_val == 1000
-            or getattr(status_val, "value", None) == 1000
-            or getattr(status_val, "name", "") == "AVAILABLE"
-            or getattr(cand, "running", False)
-        )
-        _gemini_authenticated = is_avail
-        _gemini_init_error = None
-        raw_models = cand.list_models() if hasattr(cand, "list_models") else []
-        models_info = [f"{getattr(m, 'display_name', m)}" for m in (raw_models or []) if getattr(m, "is_available", True)]
-        logger.info("Gemini Web inicializado com sucesso! Modelos: %s (status=%s)", models_info, status_val)
-    except Exception as e:
-        _gemini_client = None
-        _gemini_authenticated = False
+
+    _gemini_init_started = time.monotonic()
+    _gemini_init_task = asyncio.create_task(_do_init())
+    try:
+        await _gemini_init_task
+    except Exception:
         _gemini_ready = False
-        _gemini_init_error = f"{type(e).__name__}: {str(e)[:45]}"
-        logger.warning("Falha ao inicializar Gemini com cookies: %s", e)
+        _gemini_init_task = None
+        raise
 
 
 def warmup_gemini_background():
@@ -498,32 +363,29 @@ def warmup_gemini_background():
         logger.warning("Aquecimento do Gemini em background falhou: %s", e)
 
 
-def warmup_gemini(max_wait=7.0):
-    """Aguarda a inicializacao do Gemini de forma segura e sincronizada no request atual."""
-    global _gemini_ready, _gemini_client, _gemini_init_error
+def warmup_gemini(max_wait=5.0):
+    """Aguarda a inicializacao do Gemini ate max_wait segundos sem cancelar se ainda estiver dentro do prazo normal (~8s)."""
+    global _gemini_ready, _gemini_init_task
     if _gemini_ready and _gemini_client is not None:
         return True
-    t0 = time.monotonic()
     try:
         loop = _ensure_gemini_loop()
         fut = asyncio.run_coroutine_threadsafe(_init_gemini_async(), loop)
         fut.result(timeout=max_wait)
-        return bool(_gemini_ready and _gemini_client is not None)
+        return True
     except concurrent.futures.TimeoutError:
-        dur = time.monotonic() - t0
-        _gemini_init_error = f"timeout apos {dur:.1f}s"
-        logger.warning("Aquecimento do Gemini excedeu timeout de %.1fs", max_wait)
+        logger.warning("Aquecimento do Gemini ainda em andamento apos %.1fs (continua em background).", max_wait)
         return False
     except Exception as e:
-        _gemini_init_error = f"{type(e).__name__}: {str(e)[:45]}"
         logger.warning("Aquecimento do Gemini falhou: %s", e)
+        _gemini_ready = False
+        _gemini_init_task = None
         return False
 
 
 def _select_gemini_candidates(client, preferred_model=""):
     """Retorna a lista ordenada de modelos disponiveis na conta, priorizando o 3.8 Flash."""
-    raw_models = client.list_models() if hasattr(client, "list_models") else []
-    avail = [m for m in (raw_models or []) if getattr(m, "is_available", True)]
+    avail = [m for m in (client.list_models() or []) if getattr(m, "is_available", True)]
     if not _gemini_authenticated:
         if avail:
             m0 = avail[0]
@@ -593,7 +455,7 @@ def ask_gemini(
     t0 = time.monotonic()
     loop = _ensure_gemini_loop()
     if not _gemini_ready or _gemini_client is None:
-        if not warmup_gemini(max_wait=min(6.8, max(2.5, timeout - 1.5))):
+        if not warmup_gemini(max_wait=min(4.2, max(2.0, timeout - 2.2))):
             raise AIError("GEMINI_NOT_WARMED")
 
     cfg = _load_gemini_config()
@@ -637,16 +499,13 @@ def ask_gemini(
             if remaining < 1.0:
                 break
             try:
-                try:
-                    coro = _gemini_client.generate_content(
-                        prompt,
-                        model=model_obj,
-                        chat=chat_session,
-                        temporary=(not should_save_history) if _gemini_authenticated else False,
-                        extended_thinking=extended_thinking,
-                    )
-                except TypeError:
-                    coro = _gemini_client.generate_content(prompt)
+                coro = _gemini_client.generate_content(
+                    prompt,
+                    model=model_obj,
+                    chat=chat_session,
+                    temporary=(not should_save_history) if _gemini_authenticated else False,
+                    extended_thinking=extended_thinking,
+                )
                 fut = asyncio.run_coroutine_threadsafe(coro, loop)
                 resp = fut.result(timeout=remaining)
                 text = (getattr(resp, "text", None) or "").strip()
@@ -664,7 +523,7 @@ def ask_gemini(
                     hist_tag = "histórico salvo" if should_save_history else "chat temporário"
                     _last_engine_used = f"Google Gemini ({model_label}, {thinking_label}, {hist_tag})"
                 else:
-                    _last_engine_used = f"Google Gemini ({model_label}, modo anônimo sem conta)"
+                    _last_engine_used = f"Google Gemini ({model_label})"
                 return text
             except concurrent.futures.TimeoutError:
                 raise AIError("GEMINI_TIMEOUT")
@@ -1417,9 +1276,6 @@ def _converse(handler_input, text):
             should_save = cfg["save_history"] if gem_save_hist is None else bool(gem_save_hist)
             modo_hist = "salvando histórico no seu Gemini" if should_save else "em modo de chat temporário"
 
-            if not _gemini_ready or _gemini_client is None:
-                warmup_gemini(max_wait=6.8)
-
             if _gemini_ready and _gemini_client is not None:
                 cands = _select_gemini_candidates(_gemini_client, cfg["preferred_model"])
                 top_label = cands[0][1] if cands else "padrão"
@@ -1430,15 +1286,14 @@ def _converse(handler_input, text):
                         f"{modo_hist}). Modelos liberados na sua conta: {all_labels}"
                     )
                 else:
-                    motivo = "cookies expiraram ou foram recusados pelo Google" if psid else "sem cookies configurados"
+                    motivo = "cookies expiraram ou foram recusados" if psid else "sem cookies configurados"
                     nome = f"Google Gemini em modo anônimo ({top_label}, {motivo})"
             else:
-                detalhe_err = f": {_gemini_init_error}" if _gemini_init_error else ""
                 if psid:
                     pref_label = cfg["preferred_model"] or "priorizando 3.8 Flash"
-                    nome = f"Google Gemini ({pref_label}, não conectou{detalhe_err})"
+                    nome = f"Google Gemini com sua conta configurada ({pref_label}, {cfg['thinking_label']}, {modo_hist})"
                 else:
-                    nome = f"Google Gemini em modo anônimo (não conectou{detalhe_err})"
+                    nome = "Google Gemini em modo anônimo (gratuito, sem cookies no secrets.json)"
         else:
             nome = "Groq (OpenAI gpt-oss-120b e contingência)"
 
