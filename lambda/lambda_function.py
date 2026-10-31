@@ -433,6 +433,18 @@ def _select_gemini_candidates(client, preferred_model=""):
         return [(None, "padrão da conta")]
 
     pref = (preferred_model or "").strip().lower()
+    if not pref:
+        flash_label = "3.8 Flash"
+        for m in avail:
+            if "flash" in m.model_name.lower() and "lite" not in m.model_name.lower():
+                flash_label = m.display_name or "3.8 Flash"
+                break
+        res = [(None, flash_label)]
+        for m in avail:
+            lbl = m.display_name or m.model_name
+            if lbl != flash_label:
+                res.append((m, lbl))
+        return res
 
     def _priority(m):
         text_all = f"{m.display_name} {m.model_name} {' '.join(getattr(m, 'aliases', []))}".lower()
@@ -1314,13 +1326,13 @@ def _converse(handler_input, text):
             modo_hist = "salvando histórico no seu Gemini" if should_save else "em modo de chat temporário"
 
             if not _gemini_ready or _gemini_client is None:
-                warmup_gemini(max_wait=5.0)
+                warmup_gemini(max_wait=7.0)
 
             if _gemini_ready and _gemini_client is not None:
                 cands = _select_gemini_candidates(_gemini_client, cfg["preferred_model"])
                 top_label = cands[0][1] if cands else "padrão"
                 if _gemini_authenticated:
-                    all_labels = ", ".join(lbl for _, lbl in cands)
+                    all_labels = ", ".join(list(dict.fromkeys(lbl for _, lbl in cands)))
                     nome = (
                         f"Google Gemini conectado na sua conta (usando {top_label}, {cfg['thinking_label']}, "
                         f"{modo_hist}). Modelos liberados na sua conta: {all_labels}"

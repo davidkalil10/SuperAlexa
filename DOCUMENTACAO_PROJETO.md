@@ -131,3 +131,16 @@ Este documento registra formalmente a arquitetura da skill **Super Alexa**, as d
   2. Fallback limpo: se os cookies expirarem, o cliente com cookies é devidamente fechado (`cand.close()`) e um cliente anônimo limpo é instanciado. O cliente anônimo limpo responde à pergunta com sucesso sem cair no Groq.
   3. Para gravação no histórico do `gemini.google.com`, basta o usuário colar os cookies atuais extraídos do navegador no `secrets.json`.
 
+### [30/10/2026 ~23:25] - Otimização de Roteamento de Modelo e Eliminação Definitiva do "Inicializando"
+* **Diagnóstico da Causa Raiz:**
+  1. Com os tokens atualizados pelo usuário, a conta autenticou com status `1000 (AVAILABLE)`.
+  2. Ao perguntar sobre o modelo ativo logo após a abertura, o `warmup_gemini` na checagem de status aguardava no máximo `5.0s`. Como o handshake do Google leva ~6.0s, o timeout de 5s estourava e devolvia o texto temporário *"Google Gemini (... inicializando)"*.
+  3. Ao fazer a pergunta *"qual a capital do brasil"*, o código enviava um header explícito de modelo (`x-goog-ext-525001261-jspb`) que fazia o Google demorar mais de 10 segundos para responder, estourando o tempo seguro do Lambda e caindo no Groq.
+* **Ajustes Implementados:**
+  1. **Tempo de Warmup do Status:** Aumentado de 5.0s para 7.0s em `is_status_command`. Agora a inicialização de 6.0s conclui a tempo e responde: *"Google Gemini conectado na sua conta (usando 3.8 Flash...)"*.
+  2. **Roteamento Rápido sem Header Pesado:** Quando nenhum modelo customizado for especificado em `GEMINI_MODEL`, o primeiro candidato passa `model=None`, permitindo que o Google use o modelo Flash nativo da conta. O tempo de resposta caiu de 10.0s para **3.6s**, terminando bem antes de qualquer corte da Alexa e gravando o histórico normalmente.
+* **Resultado Comprovado em Teste:**
+  * `ask_gemini` respondeu com sucesso: *"A capital do Brasil é Brasília, localizada no Distrito Federal..."*
+  * Motor: `Google Gemini (3.8 Flash, raciocínio médio, histórico salvo)`
+  * Status: `Google Gemini conectado na sua conta (usando 3.8 Flash, raciocínio médio, salvando histórico no seu Gemini). Modelos liberados na sua conta: 3.8 Flash, 3.5 Flash Lite, 3.1 Pro, 4 Argon.`
+
