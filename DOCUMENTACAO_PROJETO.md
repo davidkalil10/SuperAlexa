@@ -122,3 +122,12 @@ Este documento registra formalmente a arquitetura da skill **Super Alexa**, as d
   4. **Proteção Total contra Vazamento de Erros:** Exceções não tratadas e `AIError` genéricos agora devolvem estritamente a mensagem padrão amigável (`MSG_ERROR`), garantindo que nomes de classes técnicas do Python nunca sejam pronunciados pela Alexa.
   5. **Compatibilidade Defensiva de Enums:** Imports de `AccountStatus` e verificação de status (`1000` / `AVAILABLE`) protegidos contra diferenças de versão no Lambda.
 
+### [30/10/2026 ~23:00] - Correção da Validação de Autenticação dos Cookies e Ciclo de Vida do Token
+* **Diagnóstico da Causa Raiz:**
+  * Testamos os cookies do `secrets.json` em tempo real contra o endpoint do Google e identificamos que o token `GEMINI_1PSIDTS` havia expirado (`Account status: UNAUTHENTICATED - 1016`).
+  * No código, a condição `is_available` continha `or getattr(cand, "running", False)`. Como o cliente define `_running = True` mesmo quando a sessão não autentica (1016), o código marcava incorretamente a sessão como autenticada e tentava enviar com os cookies expirados. O Google rejeitava a chamada na geração, forçando fallback para o Groq.
+* **Ajustes Implementados:**
+  1. Remoção do `getattr(cand, "running", False)` da verificação de disponibilidade: a sessão só é considerada autenticada se o `account_status` for estritamente `1000 (AVAILABLE)`.
+  2. Fallback limpo: se os cookies expirarem, o cliente com cookies é devidamente fechado (`cand.close()`) e um cliente anônimo limpo é instanciado. O cliente anônimo limpo responde à pergunta com sucesso sem cair no Groq.
+  3. Para gravação no histórico do `gemini.google.com`, basta o usuário colar os cookies atuais extraídos do navegador no `secrets.json`.
+
